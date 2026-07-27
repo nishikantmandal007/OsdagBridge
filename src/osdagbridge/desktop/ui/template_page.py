@@ -794,26 +794,21 @@ class CustomWindow(QWidget):
         if getattr(self, "_settle_trim_timer", None) is None:
             self._settle_trim_timer = QTimer(self)
             self._settle_trim_timer.setSingleShot(True)
-            self._settle_trim_timer.timeout.connect(self._settle_trim)
+            self._settle_trim_timer.timeout.connect(self._idle_trim)
         self._settle_trim_timer.start(120_000)
 
-    def _settle_trim(self):
-        # Deferred idle trim; skipped if another design started in the meantime.
-        if getattr(self, "_design_running", False):
-            return
-        trim_now()
+    def _idle_trim(self):
+        # Deferred idle trim (minimize / post-design settle timer); never mid-design.
+        if not getattr(self, "_design_running", False):
+            trim_now()
 
     def changeEvent(self, event):
-        # Trim when the window is minimized (after the animation settles) so freed memory
-        # is handed back while the app sits in the taskbar — the deterministic version of
-        # the working-set trim the OS otherwise applies minutes into idling.
+        # Trim shortly after the window is minimized so freed memory is handed back while
+        # the app sits in the taskbar — the deterministic version of the working-set trim
+        # the OS otherwise applies minutes into idling.
         if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
-            QTimer.singleShot(500, self._minimize_trim)
+            QTimer.singleShot(500, self._idle_trim)
         super().changeEvent(event)
-
-    def _minimize_trim(self):
-        if self.isMinimized() and not getattr(self, "_design_running", False):
-            trim_now()
 
     def _show_design_error(self, err_trace):
         """Log a design failure and surface it to the user (main thread only)."""

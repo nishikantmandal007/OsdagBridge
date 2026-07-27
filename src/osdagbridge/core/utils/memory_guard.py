@@ -15,30 +15,51 @@ def _dbg(msg):
 _IS_WINDOWS = sys.platform == "win32"
 
 
+class _ProcessMemoryCountersEx(ctypes.Structure):
+    # PROCESS_MEMORY_COUNTERS_EX (psapi.h). PrivateUsage is the process commit charge —
+    # Task Manager's "Commit size" — and is the figure that actually tracks a leak.
+    # WorkingSetSize is the "Memory" column, which the OS trims at will when the app idles.
+    _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong)] + [
+        (n, ctypes.c_size_t) for n in (
+            "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+            "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+            "PagefileUsage", "PeakPagefileUsage", "PrivateUsage",
+        )
+    ]
+
+
+# Win32 handles, loaded and typed once. CPython links the Universal CRT, so its malloc heap
+# lives in ucrtbase.dll (msvcrt.dll is a different, legacy heap). None off Windows / on failure.
+_UCRT = _KERNEL32 = None
+if _IS_WINDOWS:
+    try:
+        _UCRT = ctypes.CDLL("ucrtbase.dll")
+        _KERNEL32 = ctypes.WinDLL("kernel32.dll")
+        _KERNEL32.GetCurrentProcess.restype = ctypes.c_void_p
+        _KERNEL32.GetProcessHeaps.argtypes = (ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p))
+        _KERNEL32.HeapCompact.restype = ctypes.c_size_t
+        _KERNEL32.HeapCompact.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        _KERNEL32.SetProcessWorkingSetSize.argtypes = (
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+        )
+        _KERNEL32.K32GetProcessMemoryInfo.argtypes = (
+            ctypes.c_void_p, ctypes.POINTER(_ProcessMemoryCountersEx), ctypes.c_ulong,
+        )
+    except Exception:
+        _UCRT = _KERNEL32 = None
+
+
 def _malloc_trim():
     # Hand free heap blocks back to the OS. gc.collect() frees objects into the allocator's
     # arena but does NOT return memory to the OS — this does. Best-effort on both platforms.
     try:
         if _IS_WINDOWS:
-            # CPython 3.5+ links the Universal CRT, so its malloc heap lives in ucrtbase.dll.
-            # msvcrt.dll is a *different*, legacy heap — calling _heapmin there would compact
-            # a heap this process never allocates from. _heapmin is the honest analogue of
-            # malloc_trim(0): it decommits genuinely free CRT-heap blocks and leaves live
-            # data resident.
-            ctypes.CDLL("ucrtbase.dll")._heapmin()
-            # Native modules built with a statically linked CRT allocate from their own
-            # heaps; HeapCompact every process heap to coalesce + decommit those too.
-            kernel32 = ctypes.WinDLL("kernel32.dll")
-            kernel32.GetProcessHeaps.restype = ctypes.c_ulong
-            kernel32.GetProcessHeaps.argtypes = (ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p))
-            kernel32.HeapCompact.restype = ctypes.c_size_t
-            kernel32.HeapCompact.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
-            n = kernel32.GetProcessHeaps(0, None)
-            if n:
-                heaps = (ctypes.c_void_p * n)()
-                n = kernel32.GetProcessHeaps(n, heaps)
-                for i in range(n):
-                    kernel32.HeapCompact(heaps[i], 0)
+            # _heapmin decommits genuinely free CRT-heap blocks (the malloc_trim analogue);
+            # HeapCompact covers the separate heaps of static-CRT native modules.
+            _UCRT._heapmin()
+            heaps = (ctypes.c_void_p * _KERNEL32.GetProcessHeaps(0, None))()
+            for h in heaps[: _KERNEL32.GetProcessHeaps(len(heaps), heaps)]:
+                _KERNEL32.HeapCompact(h, 0)
         else:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
@@ -46,27 +67,16 @@ def _malloc_trim():
 
 
 def _trim_working_set():
-    # Windows only: release the working set so Task Manager's "Memory" column reflects the
-    # post-release floor immediately instead of waiting minutes for OS idle-trimming — the
-    # visible counterpart of the Linux RSS drop after malloc_trim. Pages that are still live
-    # fault back in lazily. Called only from release() (never mid-design: re-faulting during
-    # an analysis run would slow it down). Commit (PrivateUsage) is unaffected by this call —
-    # that figure only drops when memory was genuinely freed, which is why the logs track it.
-    if not _IS_WINDOWS:
-        return
-    try:
-        kernel32 = ctypes.WinDLL("kernel32.dll")
-        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-        kernel32.SetProcessWorkingSetSize.restype = ctypes.c_int
-        kernel32.SetProcessWorkingSetSize.argtypes = (
-            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
-        )
-        # (SIZE_T)-1 for both min and max = "trim the working set as far as possible".
-        kernel32.SetProcessWorkingSetSize(
-            kernel32.GetCurrentProcess(), ctypes.c_size_t(-1).value, ctypes.c_size_t(-1).value
-        )
-    except Exception:
-        pass
+    # Windows only: release the working set — (SIZE_T)-1 min/max = "trim as far as possible" —
+    # so Task Manager's "Memory" column shows the post-release floor immediately instead of
+    # minutes later via OS idle-trimming; the visible counterpart of the Linux RSS drop.
+    # Live pages fault back in lazily, so never call this mid-design. Commit (PrivateUsage)
+    # is unaffected — it only drops when memory was genuinely freed; the logs track it.
+    if _IS_WINDOWS:
+        try:
+            _KERNEL32.SetProcessWorkingSetSize(_KERNEL32.GetCurrentProcess(), -1, -1)
+        except Exception:
+            pass
 
 
 def trim_now():
@@ -78,51 +88,19 @@ def trim_now():
     _trim_working_set()
 
 
-class _ProcessMemoryCountersEx(ctypes.Structure):
-    # PROCESS_MEMORY_COUNTERS_EX (psapi.h). PrivateUsage is the process commit charge —
-    # Task Manager's "Commit size" — and is the figure that actually tracks a leak.
-    # WorkingSetSize is the "Memory" column, which the OS trims at will when the app idles.
-    _fields_ = [
-        ("cb", ctypes.c_ulong),
-        ("PageFaultCount", ctypes.c_ulong),
-        ("PeakWorkingSetSize", ctypes.c_size_t),
-        ("WorkingSetSize", ctypes.c_size_t),
-        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-        ("PagefileUsage", ctypes.c_size_t),
-        ("PeakPagefileUsage", ctypes.c_size_t),
-        ("PrivateUsage", ctypes.c_size_t),
-    ]
-
-
-def _win_mem_mb():
-    # (working set, commit charge) in MB via K32GetProcessMemoryInfo; (None, None) on failure.
-    try:
-        counters = _ProcessMemoryCountersEx()
-        counters.cb = ctypes.sizeof(counters)
-        kernel32 = ctypes.WinDLL("kernel32.dll")
-        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-        kernel32.K32GetProcessMemoryInfo.restype = ctypes.c_int
-        kernel32.K32GetProcessMemoryInfo.argtypes = (
-            ctypes.c_void_p, ctypes.POINTER(_ProcessMemoryCountersEx), ctypes.c_ulong,
-        )
-        ok = kernel32.K32GetProcessMemoryInfo(
-            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
-        )
-        if not ok:
-            return None, None
-        return counters.WorkingSetSize / 1048576.0, counters.PrivateUsage / 1048576.0
-    except Exception:
-        return None, None
-
-
 def proc_mem_mb():
     # Current process (resident, virtual) in MB; (None, None) if unavailable.
     # Linux: VmRSS / VmSize from /proc/self/status. Windows: working set / commit charge.
     if _IS_WINDOWS:
-        return _win_mem_mb()
+        try:
+            counters = _ProcessMemoryCountersEx(cb=ctypes.sizeof(_ProcessMemoryCountersEx))
+            if _KERNEL32.K32GetProcessMemoryInfo(
+                _KERNEL32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+            ):
+                return counters.WorkingSetSize / 1048576.0, counters.PrivateUsage / 1048576.0
+        except Exception:
+            pass
+        return None, None
     rss = virt = None
     try:
         with open("/proc/self/status") as f:
