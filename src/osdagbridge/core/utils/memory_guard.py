@@ -69,6 +69,15 @@ def _trim_working_set():
         pass
 
 
+def trim_now():
+    # One deterministic settle pass: collect, return free heap to the OS, and (Windows)
+    # release the working set. For idle moments (minimize, post-design settle timer) —
+    # cheap when there is nothing to free. Callers must not invoke this mid-design.
+    gc.collect()
+    _malloc_trim()
+    _trim_working_set()
+
+
 class _ProcessMemoryCountersEx(ctypes.Structure):
     # PROCESS_MEMORY_COUNTERS_EX (psapi.h). PrivateUsage is the process commit charge —
     # Task Manager's "Commit size" — and is the figure that actually tracks a leak.

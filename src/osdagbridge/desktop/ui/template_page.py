@@ -21,6 +21,7 @@ from osdagbridge.core.bridge_types.plate_girder.defaults import BASIC_INPUT_DICT
 from osdagbridge.core.utils.common import *
 from osdagbridge.core.utils.osi_validator import validate_osi_inputs
 from osdagbridge.core.utils.logger import bridge_logger
+from osdagbridge.core.utils.memory_guard import trim_now
 from osdagbridge.desktop.ui.utils.custom_widgets import ToolBarWidget
 from osdagbridge.desktop.ui.utils.custom_cursors import pointing_hand_cursor
 
@@ -684,6 +685,11 @@ class CustomWindow(QWidget):
                 return
             self._design_running = True
 
+            # A new run supersedes any pending post-design settle trim.
+            settle_timer = getattr(self, "_settle_trim_timer", None)
+            if settle_timer is not None:
+                settle_timer.stop()
+
             self._start_loading()
 
             # Redirect stdout on the main thread before the worker starts; the
@@ -782,6 +788,32 @@ class CustomWindow(QWidget):
         if not cancelled:
             # Focus 3D-Cad widget
             self.cad_3d_view_toggle(force_show=True)
+
+        # One settle trim a couple of minutes after the run ends, once plots/CAD caches
+        # have stabilized — mirrors the post-design memory settling seen on Linux.
+        if getattr(self, "_settle_trim_timer", None) is None:
+            self._settle_trim_timer = QTimer(self)
+            self._settle_trim_timer.setSingleShot(True)
+            self._settle_trim_timer.timeout.connect(self._settle_trim)
+        self._settle_trim_timer.start(120_000)
+
+    def _settle_trim(self):
+        # Deferred idle trim; skipped if another design started in the meantime.
+        if getattr(self, "_design_running", False):
+            return
+        trim_now()
+
+    def changeEvent(self, event):
+        # Trim when the window is minimized (after the animation settles) so freed memory
+        # is handed back while the app sits in the taskbar — the deterministic version of
+        # the working-set trim the OS otherwise applies minutes into idling.
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(500, self._minimize_trim)
+        super().changeEvent(event)
+
+    def _minimize_trim(self):
+        if self.isMinimized() and not getattr(self, "_design_running", False):
+            trim_now()
 
     def _show_design_error(self, err_trace):
         """Log a design failure and surface it to the user (main thread only)."""
