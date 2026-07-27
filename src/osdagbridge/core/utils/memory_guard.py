@@ -2,6 +2,7 @@
 import ctypes
 import gc
 import os
+import sys
 import types
 
 
@@ -11,19 +12,108 @@ def _dbg(msg):
         print(f"[OPS-MEMORY] {msg}", flush=True)
 
 
+_IS_WINDOWS = sys.platform == "win32"
+
+
 def _malloc_trim():
-    # Return free glibc heap arenas to the OS. gc.collect() frees objects into the
-    # allocator's arena but does NOT hand memory back to the OS — this does.
-    # Best-effort: no-op on non-glibc platforms.
+    # Hand free heap blocks back to the OS. gc.collect() frees objects into the allocator's
+    # arena but does NOT return memory to the OS — this does. Best-effort on both platforms.
     try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        if _IS_WINDOWS:
+            # CPython 3.5+ links the Universal CRT, so its malloc heap lives in ucrtbase.dll.
+            # msvcrt.dll is a *different*, legacy heap — calling _heapmin there would compact
+            # a heap this process never allocates from. _heapmin is the honest analogue of
+            # malloc_trim(0): it decommits genuinely free CRT-heap blocks and leaves live
+            # data resident.
+            ctypes.CDLL("ucrtbase.dll")._heapmin()
+            # Native modules built with a statically linked CRT allocate from their own
+            # heaps; HeapCompact every process heap to coalesce + decommit those too.
+            kernel32 = ctypes.WinDLL("kernel32.dll")
+            kernel32.GetProcessHeaps.restype = ctypes.c_ulong
+            kernel32.GetProcessHeaps.argtypes = (ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p))
+            kernel32.HeapCompact.restype = ctypes.c_size_t
+            kernel32.HeapCompact.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+            n = kernel32.GetProcessHeaps(0, None)
+            if n:
+                heaps = (ctypes.c_void_p * n)()
+                n = kernel32.GetProcessHeaps(n, heaps)
+                for i in range(n):
+                    kernel32.HeapCompact(heaps[i], 0)
+        else:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
 
 
+def _trim_working_set():
+    # Windows only: release the working set so Task Manager's "Memory" column reflects the
+    # post-release floor immediately instead of waiting minutes for OS idle-trimming — the
+    # visible counterpart of the Linux RSS drop after malloc_trim. Pages that are still live
+    # fault back in lazily. Called only from release() (never mid-design: re-faulting during
+    # an analysis run would slow it down). Commit (PrivateUsage) is unaffected by this call —
+    # that figure only drops when memory was genuinely freed, which is why the logs track it.
+    if not _IS_WINDOWS:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32.dll")
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessWorkingSetSize.restype = ctypes.c_int
+        kernel32.SetProcessWorkingSetSize.argtypes = (
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+        )
+        # (SIZE_T)-1 for both min and max = "trim the working set as far as possible".
+        kernel32.SetProcessWorkingSetSize(
+            kernel32.GetCurrentProcess(), ctypes.c_size_t(-1).value, ctypes.c_size_t(-1).value
+        )
+    except Exception:
+        pass
+
+
+class _ProcessMemoryCountersEx(ctypes.Structure):
+    # PROCESS_MEMORY_COUNTERS_EX (psapi.h). PrivateUsage is the process commit charge —
+    # Task Manager's "Commit size" — and is the figure that actually tracks a leak.
+    # WorkingSetSize is the "Memory" column, which the OS trims at will when the app idles.
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    ]
+
+
+def _win_mem_mb():
+    # (working set, commit charge) in MB via K32GetProcessMemoryInfo; (None, None) on failure.
+    try:
+        counters = _ProcessMemoryCountersEx()
+        counters.cb = ctypes.sizeof(counters)
+        kernel32 = ctypes.WinDLL("kernel32.dll")
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.K32GetProcessMemoryInfo.restype = ctypes.c_int
+        kernel32.K32GetProcessMemoryInfo.argtypes = (
+            ctypes.c_void_p, ctypes.POINTER(_ProcessMemoryCountersEx), ctypes.c_ulong,
+        )
+        ok = kernel32.K32GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        )
+        if not ok:
+            return None, None
+        return counters.WorkingSetSize / 1048576.0, counters.PrivateUsage / 1048576.0
+    except Exception:
+        return None, None
+
+
 def proc_mem_mb():
-    # Current process (RSS, VIRT) in MB from /proc/self/status; (None, None) if unavailable.
+    # Current process (resident, virtual) in MB; (None, None) if unavailable.
+    # Linux: VmRSS / VmSize from /proc/self/status. Windows: working set / commit charge.
+    if _IS_WINDOWS:
+        return _win_mem_mb()
     rss = virt = None
     try:
         with open("/proc/self/status") as f:
@@ -47,6 +137,10 @@ class _Mallinfo2(ctypes.Structure):
 
 def proc_native_mb():
     # glibc allocator (in-use, mmap) in MB via mallinfo2; (None, None) off glibc / on failure.
+    # Windows has no safe equivalent (HeapWalk needs HeapLock); the commit charge from
+    # proc_mem_mb() is the leak-tracking floor metric there instead.
+    if _IS_WINDOWS:
+        return None, None
     try:
         libc = ctypes.CDLL("libc.so.6")
         libc.mallinfo2.restype = _Mallinfo2
@@ -56,16 +150,27 @@ def proc_native_mb():
         return None, None
 
 
+# Names for the (resident, virtual) pair returned by proc_mem_mb(), per platform. On Windows
+# the second figure is the commit charge, which is the number to watch across design cycles:
+# the first (working set) is trimmed by the OS whenever the app idles, so it drops on its own
+# without anything having been freed.
+_RESIDENT_LABEL = "WorkingSet" if _IS_WINDOWS else "RSS"
+_VIRTUAL_LABEL = "Commit" if _IS_WINDOWS else "VIRT"
+
+
 def log_memory(tag):
-    # Print the current process RSS / VIRT (+ glibc in-use/mmap) with a tag.
+    # Print the current process resident / virtual (+ glibc in-use/mmap) with a tag.
     rss, virt = proc_mem_mb()
     in_use, mmap_mb = proc_native_mb()
     if rss is None:
         _dbg(f"{tag}: memory unavailable")
     elif in_use is None:
-        _dbg(f"{tag}: RSS {rss:.0f} MB | VIRT {virt:.0f} MB")
+        _dbg(f"{tag}: {_RESIDENT_LABEL} {rss:.0f} MB | {_VIRTUAL_LABEL} {virt:.0f} MB")
     else:
-        _dbg(f"{tag}: RSS {rss:.0f} MB | VIRT {virt:.0f} MB | in-use {in_use:.0f} MB | mmap {mmap_mb:.0f} MB")
+        _dbg(
+            f"{tag}: {_RESIDENT_LABEL} {rss:.0f} MB | {_VIRTUAL_LABEL} {virt:.0f} MB "
+            f"| in-use {in_use:.0f} MB | mmap {mmap_mb:.0f} MB"
+        )
     return rss, virt
 
 
@@ -256,8 +361,10 @@ class OpsMemoryGuard:
         # Census the C++ domain immediately after wipe: 0/0 = clean, anything else = native leak.
         census_opensees_domain("release")
         gc.collect()
-        # Hand the freed arena back to the OS so RSS actually drops.
+        # Hand the freed arena back to the OS so the resident figure actually drops.
         _malloc_trim()
+        # Windows: also release the working set so Task Manager reflects the drop now.
+        _trim_working_set()
         after_rss, after_virt = proc_mem_mb()
         # in-use (glibc mallinfo2) at the post-teardown floor: the decisive true-leak metric.
         in_use, mmap_mb = proc_native_mb()
@@ -265,8 +372,8 @@ class OpsMemoryGuard:
             # Positive reclaimed = memory returned to the OS by wipe + gc.
             msg = (
                 f"release: heavy backend data dropped + domain wiped — "
-                f"RSS {before_rss:.0f} -> {after_rss:.0f} MB "
-                f"(reclaimed {before_rss - after_rss:.0f} MB) | VIRT {after_virt:.0f} MB"
+                f"{_RESIDENT_LABEL} {before_rss:.0f} -> {after_rss:.0f} MB "
+                f"(reclaimed {before_rss - after_rss:.0f} MB) | {_VIRTUAL_LABEL} {after_virt:.0f} MB"
             )
             if in_use is not None:
                 msg += f" | in-use {in_use:.0f} MB | mmap {mmap_mb:.0f} MB"
@@ -297,14 +404,16 @@ class OpsMemoryGuard:
                 del container[:]
                 cleared += 1
         gc.collect()
-        # Hand the freed arena back to the OS so RSS actually drops.
+        # Hand the freed arena back to the OS so the resident figure actually drops.
+        # No _trim_working_set() here: this runs mid-design, and forcing the live analysis
+        # pages out only to fault straight back in would slow the run for nothing.
         _malloc_trim()
         after_rss, after_virt = proc_mem_mb()
         if before_rss is not None and after_rss is not None:
             _dbg(
                 f"clear_intermediate_results: cleared {cleared} raw record container(s) — "
-                f"RSS {before_rss:.0f} -> {after_rss:.0f} MB "
-                f"(reclaimed {before_rss - after_rss:.0f} MB) | VIRT {after_virt:.0f} MB"
+                f"{_RESIDENT_LABEL} {before_rss:.0f} -> {after_rss:.0f} MB "
+                f"(reclaimed {before_rss - after_rss:.0f} MB) | {_VIRTUAL_LABEL} {after_virt:.0f} MB"
             )
         else:
             _dbg(f"clear_intermediate_results: cleared {cleared} raw record container(s)")
