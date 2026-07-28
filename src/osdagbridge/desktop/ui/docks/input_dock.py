@@ -76,6 +76,7 @@ class InputDock(QWidget):
         self._material_combo_map           = {}   # key → QComboBox  (is_material_field only)
         self._material_member_type         = {}   # key → "Girder"|"Deck"
         self._material_custom_fields       = {}
+        self._material_export_cache        = {}   # (key, material, custom fields) → export fields
         self._material_previous_selection  = {}
         # key → list of (widget_ref, placeholder_method_name) for dynamic placeholders
         self._dynamic_placeholder_map: dict[str, tuple[QLineEdit, str]] = {}
@@ -329,12 +330,20 @@ class InputDock(QWidget):
                 continue
 
             try:
-                # Pass the actual key (e.g. KEY_CROSS_BRACING) as member
-                # so the dialog's get_export_fields() uses the correct prefix.
                 custom_flds = self._material_custom_fields.get(selected)
-                dlg = MaterialPropertiesDialog(read_only=True, selected_material=selected, member=key, custom_fields=custom_flds)
-                # Use exported, member-prefixed keys
-                fields = dlg.get_export_fields() or {}
+                # Cache the exported fields: they depend only on the member key,
+                # material and custom fields, and building the full dialog per
+                # combo on every Design click leaks parentless QDialogs.
+                cache_key = (key, selected, tuple(sorted((custom_flds or {}).items())))
+                fields = self._material_export_cache.get(cache_key)
+                if fields is None:
+                    # Pass the actual key (e.g. KEY_CROSS_BRACING) as member
+                    # so the dialog's get_export_fields() uses the correct prefix.
+                    dlg = MaterialPropertiesDialog(read_only=True, selected_material=selected, member=key, custom_fields=custom_flds)
+                    # Use exported, member-prefixed keys
+                    fields = dict(dlg.get_export_fields() or {})
+                    dlg.deleteLater()
+                    self._material_export_cache[cache_key] = fields
                 for fld_key, fld_val in fields.items():
                     self._update_input_dict(fld_key, fld_val)
                 self._update_input_dict(key, selected)
