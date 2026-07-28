@@ -876,6 +876,12 @@ class OutputDock(QWidget):
         for key in (KEY_OUTPUT_DOCK_MEMBER_ID, KEY_OUTPUT_DOCK_LOAD_COMBINATION):
             combo = self._w(key)
             if combo is not None:
+                # Called once per design run — disconnect first so connections
+                # don't accumulate across design/unlock cycles.
+                try:
+                    combo.currentTextChanged.disconnect(self._on_design_selection_changed)
+                except (RuntimeError, TypeError):
+                    pass
                 combo.currentTextChanged.connect(self._on_design_selection_changed)
 
     def _on_design_selection_changed(self):
