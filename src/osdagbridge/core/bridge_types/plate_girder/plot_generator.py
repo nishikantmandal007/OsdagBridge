@@ -2,7 +2,6 @@ import io
 from collections import defaultdict
 
 import matplotlib
-import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 import matplotlib.colors as mcolors
 from matplotlib.ticker import FuncFormatter
@@ -1552,12 +1551,18 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
     return fig, summary_data
 
 
+def _dispose_figure(fig):
+    """Tear down a manager-less figure (plt.close() is a no-op on these)."""
+    fig.clear()
+    fig.set_canvas(None)
+
+
 def figure_to_bytes(fig, fmt="png", dpi=150):
     """Convenience helper — render a matplotlib figure to raw bytes."""
     buf = io.BytesIO()
     fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches=None, facecolor="white")
     buf.seek(0)
-    plt.close(fig)
+    _dispose_figure(fig)
     return buf.read()
 
 def _render_report_figure(fig, show_max: bool, show_min: bool):
@@ -1587,7 +1592,7 @@ def _render_report_figure(fig, show_max: bool, show_min: bool):
         # omitted — it triggers multiple extra render passes on 3D axes.
         raw_buf = io.BytesIO()
         fig.savefig(raw_buf, format='png', dpi=150, facecolor='white')
-        plt.close(fig)
+        _dispose_figure(fig)
         raw_buf.seek(0)
 
         try:
@@ -1610,7 +1615,7 @@ def _render_report_figure(fig, show_max: bool, show_min: bool):
     except Exception as exc:
         _log.warning("_render_report_figure: %s", exc)
         try:
-            plt.close(fig)
+            _dispose_figure(fig)
         except Exception:
             pass
     return None

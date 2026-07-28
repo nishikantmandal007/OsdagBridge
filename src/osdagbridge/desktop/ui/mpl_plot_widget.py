@@ -3,8 +3,7 @@ matplotlib.use("QtAgg")
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Path3DCollection 
+from mpl_toolkits.mplot3d.art3d import Path3DCollection
 from html import escape
 import re
 
@@ -257,9 +256,7 @@ class MplPlotWidget(QWidget):
         ))
         self._navcube.hide()
         self._navcube_sync = MatplotlibNavCubeSync(self._canvas, self._navcube)
-        self._canvas.mpl_connect("button_press_event",   lambda e: self._navcube_sync.set_interaction_active(True)  if e.button == 1 and not self._pan_active and not self._rotate_active else None)
-        self._canvas.mpl_connect("button_release_event", lambda e: self._navcube_sync.set_interaction_active(False) if e.button == 1 and not self._pan_active and not self._rotate_active else None)
-        self._canvas.mpl_connect("motion_notify_event",  lambda e: self._navcube_sync.force_sync() if e.button == 1 and not self._pan_active and not self._rotate_active else None)
+        self._connect_figure_callbacks()
         # ──────────────────────────────────────────────────────────
 
         # zoom toolbar
@@ -344,7 +341,6 @@ class MplPlotWidget(QWidget):
         self._cb_max = None
         self._cb_min = None
 
-        plt.close(self._fig)
         self._fig = Figure(figsize=(14, 6), facecolor="white")
         self._attach_figure(self._fig)
         self._canvas.draw_idle()
@@ -371,10 +367,11 @@ class MplPlotWidget(QWidget):
 
         combo_member = self._output_dock.output_widget.findChild(QComboBox, "analysis.member")
         if combo_member is not None:
-            try:
-                combo_member.currentTextChanged.disconnect(self.update_plot)
-            except RuntimeError:
-                pass
+            for slot in (self.update_plot, self._on_member_grillage_refresh):
+                try:
+                    combo_member.currentTextChanged.disconnect(slot)
+                except RuntimeError:
+                    pass
 
         for rb in self._output_dock.output_widget.findChildren(CustomRadioButton):
             if rb.text() in _RICH_LABEL_TO_FORCE:
@@ -451,7 +448,7 @@ class MplPlotWidget(QWidget):
         if combo_member is not None:
             combo_member.currentTextChanged.connect(self.update_plot)
             # Make sure it fires an update if changed from UI, since grillage might be active
-            combo_member.currentTextChanged.connect(lambda text: self._on_grillage_toggled(self._grillage_mode) if self._grillage_mode else None)
+            combo_member.currentTextChanged.connect(self._on_member_grillage_refresh)
 
         # 2. Connect Force Radios
         from osdagbridge.desktop.ui.utils.custom_widgets import CustomRadioButton
@@ -531,10 +528,7 @@ class MplPlotWidget(QWidget):
                 old_elev = old_ax.elev
                 old_azim = old_ax.azim
 
-        # NOW we can safely destroy the old plot
-        plt.close(self._fig)
-        
-        self._summary_data = {} 
+        self._summary_data = {}
 
         # (Your existing if/elif/else block to build the new figures)
         eng_scale = self._eng_scale
@@ -705,6 +699,10 @@ class MplPlotWidget(QWidget):
         self._apply_annotation_visibility()
         self._canvas.draw_idle()
 
+    def _on_member_grillage_refresh(self, _text):
+        if self._grillage_mode:
+            self._on_grillage_toggled(True)
+
     # Toolbar Slots
     def _on_grillage_toggled(self, checked: bool):
         self._grillage_mode = checked
@@ -714,7 +712,6 @@ class MplPlotWidget(QWidget):
             if self._fig and self._fig.axes and hasattr(self._fig.axes[0], 'elev'):
                 old_elev = self._fig.axes[0].elev
                 old_azim = self._fig.axes[0].azim
-            plt.close(self._fig)
             sel_girder = self._current_member()
             self._fig = build_figure_grillage(self._nodes, self._members, edge_dist=self._edge_dist, selected_girder=sel_girder)
             self._attach_figure(self._fig)
@@ -877,10 +874,40 @@ class MplPlotWidget(QWidget):
                 if text.get_gid() == "element_number":
                     text.set_visible(self._show_element_numbers)
 
+    def _nc_on_press(self, e):
+        if e.button == 1 and not self._pan_active and not self._rotate_active:
+            self._navcube_sync.set_interaction_active(True)
+
+    def _nc_on_release(self, e):
+        if e.button == 1 and not self._pan_active and not self._rotate_active:
+            self._navcube_sync.set_interaction_active(False)
+
+    def _nc_on_motion(self, e):
+        if e.button == 1 and not self._pan_active and not self._rotate_active:
+            self._navcube_sync.force_sync()
+
+    def _connect_figure_callbacks(self):
+        """(Re)register the canvas callbacks that live on the current figure."""
+        self._canvas.mpl_connect("button_press_event",   self._nc_on_press)
+        self._canvas.mpl_connect("button_release_event", self._nc_on_release)
+        self._canvas.mpl_connect("motion_notify_event",  self._nc_on_motion)
+        if self._rotate_active:
+            self._connect_rotate_cids()
+
     def _attach_figure(self, fig):
         """Install a rebuilt figure using QtAgg's current DPR-aware canvas size."""
+        old = self._canvas.figure
+        if old is not None and old is not fig:
+            # These figures have no pyplot manager, so plt.close() would be a
+            # silent no-op — tear down the artist/transform graph explicitly
+            # or every design retains its full 3-D figure.
+            old.clear()
+            old.set_canvas(None)
         self._canvas.figure = fig
         fig.set_canvas(self._canvas)
+        # Canvas callbacks live on the figure (figure._canvas_callbacks), so
+        # all cids died with the old figure — re-register on the new one.
+        self._connect_figure_callbacks()
         dpr = float(getattr(self._canvas, "device_pixel_ratio", 1.0))
         width = self._canvas.width() * dpr
         height = self._canvas.height() * dpr
@@ -1326,9 +1353,7 @@ class MplPlotWidget(QWidget):
             self._canvas.setCursor(Qt.OpenHandCursor)
             # Connect only for cursor management and NavCube sync;
             # actual rotation is handled entirely by matplotlib internals.
-            self._cid_press   = self._canvas.mpl_connect("button_press_event",   self._rot_on_press)
-            self._cid_motion  = self._canvas.mpl_connect("motion_notify_event",  self._rot_on_motion)
-            self._cid_release = self._canvas.mpl_connect("button_release_event", self._rot_on_release)
+            self._connect_rotate_cids()
         else:
             self._rotate_active   = False
             self._rotate_dragging = False
@@ -1359,6 +1384,11 @@ class MplPlotWidget(QWidget):
         if self._rotate_active:
             self._canvas.setCursor(Qt.OpenHandCursor)
         self._navcube_sync.force_sync()
+
+    def _connect_rotate_cids(self):
+        self._cid_press   = self._canvas.mpl_connect("button_press_event",   self._rot_on_press)
+        self._cid_motion  = self._canvas.mpl_connect("motion_notify_event",  self._rot_on_motion)
+        self._cid_release = self._canvas.mpl_connect("button_release_event", self._rot_on_release)
 
     def _set_native_3d_mouse(self, rotate_btn=1, zoom_btn=3):
         if not self._fig or not self._fig.axes:
