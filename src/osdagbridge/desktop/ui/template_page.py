@@ -677,6 +677,7 @@ class CustomWindow(QWidget):
             # read a refresh-synced key (KEY_WL_BASIC_WIND_SPEED) as their input.
             self._sync_refresh_entries_to_input_dict()
 
+            import os
             import sys
             import traceback
 
@@ -690,39 +691,59 @@ class CustomWindow(QWidget):
             if settle_timer is not None:
                 settle_timer.stop()
 
+            bridge_logger.reset_run_state()
             self._start_loading()
 
-            # Redirect stdout on the main thread before the worker starts; the
-            # worker's prints are marshalled to the log via bridge_logger.
-            original_stdout = sys.stdout
-            sys.stdout = LoggerStdoutRedirector(
-                lambda msg: bridge_logger._emit(f"[{bridge_logger._ts()}]   {msg}", "stdout_print"),
-                original_stdout,
-            )
-            self._design_original_stdout = original_stdout
+            # In-process escape hatch (debugging/bisection): the analysis then
+            # runs on the worker thread in this process, so redirect stdout on
+            # the main thread and marshal prints via bridge_logger. In the
+            # default subprocess mode the child redirects its own stdout.
+            inproc = os.environ.get("OSDAGBRIDGE_INPROC_DESIGN") == "1"
+            if inproc:
+                original_stdout = sys.stdout
+                sys.stdout = LoggerStdoutRedirector(
+                    lambda msg: bridge_logger._emit(f"[{bridge_logger._ts()}]   {msg}", "stdout_print"),
+                    original_stdout,
+                )
+                self._design_original_stdout = original_stdout
 
             backend = self.backend
             input_dict = self.input_dict
 
-            # Run the analysis/design pipeline on a worker thread so the Qt event
-            # loop stays responsive; all UI wiring happens on the main thread in
-            # _on_design_done (queued signal).
+            # Run the design in a spawned subprocess (driven from a worker thread
+            # so the Qt event loop stays responsive): the child's memory —
+            # OpenSees domain, ospgrillage records, heap fragmentation — is
+            # returned to the OS at process exit, which is the only guaranteed
+            # post-design floor on Windows. All UI wiring happens on the main
+            # thread in _on_design_done (queued signal).
             class _DesignWorker(QObject):
-                finished = Signal(object, str, bool)  # (exception, traceback, cancelled)
+                finished = Signal(object, str, bool, object)  # (error dict, traceback, cancelled, payload)
 
                 def run(self):
-                    exc_obj, err_trace, cancelled = None, "", False
+                    error, err_trace, cancelled, payload = None, "", False, None
                     try:
-                        backend.set_input(input_dict)
-                        backend.design()
+                        if inproc:
+                            backend.set_input(input_dict)
+                            backend.design()
+                        else:
+                            from osdagbridge.core.bridge_types.plate_girder.design_process import (
+                                run_design_subprocess,
+                            )
+                            payload, error, cancelled = run_design_subprocess(
+                                backend, input_dict,
+                                is_cancel_requested=bridge_logger.is_cancel_requested,
+                            )
+                            err_trace = (error or {}).get("traceback", "")
                     except RuntimeError as exc:
                         if "cancelled" in str(exc).lower():
                             cancelled = True
                         else:
-                            exc_obj, err_trace = exc, traceback.format_exc()
+                            error = {"exc_type": "RuntimeError", "message": str(exc)}
+                            err_trace = traceback.format_exc()
                     except Exception as exc:
-                        exc_obj, err_trace = exc, traceback.format_exc()
-                    self.finished.emit(exc_obj, err_trace, cancelled)
+                        error = {"exc_type": type(exc).__name__, "message": str(exc)}
+                        err_trace = traceback.format_exc()
+                    self.finished.emit(error, err_trace, cancelled, payload)
 
             self._design_thread = QThread(self)
             self._design_worker = _DesignWorker()
@@ -742,12 +763,12 @@ class CustomWindow(QWidget):
         elif trigger == "Additional Inputs":
             self._show_additional_inputs(target_tab=target_tab)
 
-    def _on_design_done(self, exc_obj, err_trace, cancelled):
+    def _on_design_done(self, error, err_trace, cancelled, payload):
         """Main-thread completion handler for the background design run."""
         import sys
         import traceback
 
-        # Worker is done printing; restore the real stdout.
+        # Worker is done printing; restore the real stdout (in-process mode only).
         if getattr(self, "_design_original_stdout", None) is not None:
             sys.stdout = self._design_original_stdout
             self._design_original_stdout = None
@@ -756,12 +777,16 @@ class CustomWindow(QWidget):
         try:
             if cancelled:
                 bridge_logger.warning("Analysis was stopped by the user.")
-            elif isinstance(exc_obj, RuntimeError):
-                bridge_logger.error(f"Analysis failed: {exc_obj}")
-            elif exc_obj is not None:
-                self._show_design_error(err_trace)
+            elif error is not None and error.get("exc_type") == "RuntimeError":
+                bridge_logger.error(f"Analysis failed: {error.get('message')}")
+            elif error is not None:
+                self._show_design_error(err_trace or error.get("message", ""))
             else:
                 try:
+                    # Subprocess mode: hydrate the backend from the child's payload
+                    # before any consumer below reads it.
+                    if payload is not None:
+                        self.backend.apply_design_payload(payload)
                     self.output_dock.refresh_loadcase_dropdowns()
                     self.output_dock.refresh_member_dropdown()
                     self.output_dock.connect_design_dropdowns()
