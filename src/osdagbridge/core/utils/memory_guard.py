@@ -299,6 +299,10 @@ _BRIDGE_RESULT_ATTRS = (
     # never read back — same retention class as result_envelopes.
     "_results_with_envelope",
     "_dcr_engine",
+    # Subprocess-design hydration (apply_design_payload) — the shipped dataset
+    # and node/member snapshot must drop on unlock/close like live results.
+    "_hydrated_dataset",
+    "_result_snapshot",
 )
 
 # Raw per-load-case record containers on the ospgrillage Results object.

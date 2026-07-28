@@ -167,6 +167,16 @@ class BridgeLogger:
     def cancel(self) -> None:
         self._cancelled = True
 
+    def is_cancel_requested(self) -> bool:
+        """Non-destructive poll: has cancel() or any poller requested a stop?"""
+        return self._cancelled or any(poller() for poller in list(self._cancel_pollers))
+
+    def reset_run_state(self) -> None:
+        """Parent-side reset before a subprocess design run — the child's
+        analysis_start() resets its own copies, not this process's."""
+        self._cancelled = False
+        self._success_log = []
+
     def check_cancel(self) -> None:
         if any(poller() for poller in list(self._cancel_pollers)):
             self._cancelled = True

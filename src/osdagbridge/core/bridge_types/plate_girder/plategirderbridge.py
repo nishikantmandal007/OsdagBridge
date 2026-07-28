@@ -370,6 +370,12 @@ class PlateGirderBridge:
         # Analyser — populated by setup_grillage()
         self.grillage_model: BridgeGrillageModel = BridgeGrillageModel()
 
+        # Subprocess-design hydration (apply_design_payload): the shipped
+        # dataset and node/member/load snapshot replace the live grillage
+        # model as the source for post-design getters.
+        self._hydrated_dataset = None
+        self._result_snapshot = None
+
         # Central ospgrillage / OpenSeesPy memory-release policy (see OpsMemoryGuard).
         self.memory = OpsMemoryGuard(self)
 
@@ -826,6 +832,110 @@ class PlateGirderBridge:
     def reset(self) -> None:
         # Release all heavy analysis memory (unlock / app-close entry point).
         self.memory.release()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Subprocess design: payload export (child) / hydration (parent)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def export_design_payload(self):
+        """
+        Capture everything the GUI reads post-design as plain picklable data.
+        Runs in the design child process while the OpenSees domain is live.
+        """
+        from osdagbridge.core.bridge_types.plate_girder.design_process import (
+            DesignPayload, ResultSnapshot,
+        )
+        from osdagbridge.core.bridge_types.plate_girder.graph_engine import (
+            extract_load_descriptors,
+        )
+
+        nodes, members = build_nodes_members()
+        dataset = self.get_results_dataset()
+        loadcases = (
+            [str(lc) for lc in dataset.coords["Loadcase"].values]
+            if dataset is not None else []
+        )
+        loads_by_case = {}
+        for name in loadcases + ["Girder Self Weight"]:
+            try:
+                loads_by_case[name] = extract_load_descriptors(self.grillage_model, name)
+            except Exception:
+                loads_by_case[name] = []
+
+        # forces/displacements are LazyLoadcaseResults over the dataset —
+        # dropped here and rebuilt parent-side from the shipped dataset.
+        result_data = dict(self.result_data)
+        result_data["forces"] = None
+        result_data["displacements"] = None
+
+        return DesignPayload(
+            input_dict=dict(self.input_dict),
+            output_dict=dict(self.output_dict),
+            design_results=getattr(self, "design_results", None) or {},
+            deck_design_results=getattr(self, "deck_design_results", None) or {},
+            crossbracing_design_results=getattr(self, "crossbracing_design_results", None) or {},
+            end_diaphragm_design_results=getattr(self, "end_diaphragm_design_results", None) or {},
+            load_effects_cache=getattr(self, "_load_effects_cache", None) or {},
+            deflections_cache=getattr(self, "_deflections_cache", None) or {},
+            lc_summary=getattr(self, "_lc_summary", None) or {},
+            reaction_summary=getattr(self, "_reaction_summary", None) or {},
+            grillage_geometry=self.grillage_geometry,
+            deck_layout=self.deck_layout,
+            material_props=getattr(self, "material_props", None),
+            dataset=dataset,
+            snapshot=ResultSnapshot(
+                captured_nodes=nodes,
+                captured_members=members,
+                loads_by_case=loads_by_case,
+            ),
+            result_data=result_data,
+            design_log=bridge_logger.get_success_log(),
+        )
+
+    def apply_design_payload(self, payload) -> None:
+        """Hydrate this backend from a subprocess design's payload (GUI process)."""
+        from osdagbridge.core.bridge_types.plate_girder.results_data import LazyLoadcaseResults
+        from osdagbridge.core.bridge_types.plate_girder.results_data_post_processing import (
+            FORCE_KEEP, DISP_KEEP,
+        )
+
+        # Drop the previous run's state first — same policy as a redesign.
+        self.memory.release()
+
+        self.input_dict = payload.input_dict
+        self.basic_inputs = {
+            k: v for k, v in self.input_dict.items() if k in self._BASIC_INPUT_KEYS
+        }
+        self.additional_inputs = {
+            k: v for k, v in self.input_dict.items() if k not in self._BASIC_INPUT_KEYS
+        }
+
+        out = dict(payload.output_dict)
+        out.setdefault("design_log", list(payload.design_log))
+        self.output_dict = types.MappingProxyType(out)
+
+        self.design_results = payload.design_results
+        self.deck_design_results = payload.deck_design_results
+        self.crossbracing_design_results = payload.crossbracing_design_results
+        self.end_diaphragm_design_results = payload.end_diaphragm_design_results
+        self._load_effects_cache = payload.load_effects_cache
+        self._deflections_cache = payload.deflections_cache
+        self._lc_summary = payload.lc_summary
+        self._reaction_summary = payload.reaction_summary
+        self.grillage_geometry = payload.grillage_geometry
+        self.deck_layout = payload.deck_layout
+        self.material_props = payload.material_props
+
+        result_data = dict(payload.result_data)
+        ds = payload.dataset
+        if ds is not None and "forces" in ds.data_vars:
+            result_data["forces"] = LazyLoadcaseResults(ds, "forces", FORCE_KEEP)
+        if ds is not None and "displacements" in ds.data_vars:
+            result_data["displacements"] = LazyLoadcaseResults(ds, "displacements", DISP_KEEP)
+        self.result_data = result_data
+
+        self._hydrated_dataset = ds
+        self._result_snapshot = payload.snapshot
 
     def _export_cad_figures(self, cad_generator) -> dict:
         """
@@ -3337,6 +3447,8 @@ class PlateGirderBridge:
         model.get_results() rebuild — after clear_intermediate_results() the raw
         records are empty, so the cached copy is the only complete dataset.
         """
+        if self._hydrated_dataset is not None:
+            return self._hydrated_dataset
         if self.grillage_model.model is None:
             return None
         cached = getattr(self.grillage_model, '_deduplicated_results', None)
@@ -3381,7 +3493,7 @@ class PlateGirderBridge:
             return None
         return PlateGirderAnalysisResults(
             dataset=results,
-            bridge=self.grillage_model,
+            bridge=self._result_snapshot if self._result_snapshot is not None else self.grillage_model,
         )
 
     def compute_load_effects_cache(self) -> None:
@@ -3884,7 +3996,10 @@ class PlateGirderBridge:
     def get_available_loadcases(self) -> list[str]:
         """Return sorted list of loadcase name strings from the results dataset."""
         results = self.get_results_dataset()
-        handler = PlateGirderAnalysisResults(dataset=results, bridge=self.grillage_model)
+        handler = PlateGirderAnalysisResults(
+            dataset=results,
+            bridge=self._result_snapshot if self._result_snapshot is not None else self.grillage_model,
+        )
         return [str(lc) for lc in handler.get_available_loadcases()]
     
     def get_dcr_engine_for_selection(
@@ -4029,7 +4144,9 @@ class PlateGirderBridge:
         }
 
     def get_nodes_members(self) -> tuple[dict, dict]:
-        """Return (nodes, members) dicts built from the active openseespy model."""
+        """Return (nodes, members) dicts — snapshot if hydrated, else live model."""
+        if self._result_snapshot is not None:
+            return dict(self._result_snapshot.captured_nodes), dict(self._result_snapshot.captured_members)
         return build_nodes_members()
 
     def get_edge_dist(self) -> float:
