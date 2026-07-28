@@ -2412,7 +2412,9 @@ class PlateGirderBridge:
         """
         augmented = self.grillage_model.create_envelope_load_case(dataset=dataset)
         self.result_envelopes = self.grillage_model.result_envelopes
-        self._results_with_envelope = augmented
+        # Write-only attribute — no consumer anywhere; kept it out so the full
+        # augmented Dataset can't pin the post-release floor again.
+        # self._results_with_envelope = augmented
         return augmented
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -2526,7 +2528,8 @@ class PlateGirderBridge:
             analysis_results=results,
             print_report=True,
         )
-        self._dcr_engine = engine
+        # Write-only attribute — DCR consumers go through get_dcr_engine_for_selection().
+        # self._dcr_engine = engine
         bridge_logger.check_cancel()
         self.design_results = design_results
 
