@@ -134,6 +134,146 @@ _STYLE: dict = {
 }
 
 
+def extract_load_descriptors(bridge, load_case: str) -> list[dict]:
+    """
+    Parse the load scheme of one load case on a live grillage model into plain
+    {"type": "line"/"point", ...} descriptors for the 2-D scheme overlay.
+    Tries multiple attribute conventions used by ospgrillage load-case objects.
+    Requires the live model — a subprocess design captures the output of this
+    function per load case into ResultSnapshot.loads_by_case.
+    """
+    # ── Locate the load-case object ───────────────────────────────────
+    lc_obj = None
+
+    # 1) vehicle_load_cases_list
+    for lc in getattr(bridge, "vehicle_load_cases_list", []):
+        if getattr(lc, "name", "") == load_case:
+            lc_obj = lc
+            break
+
+    # 2) Any *_load_case attribute on the bridge
+    if lc_obj is None:
+        lc_lower = load_case.lower()
+        for attr in dir(bridge):
+            if not attr.endswith("_load_case"):
+                continue
+            val = getattr(bridge, attr, None)
+            if val is None:
+                continue
+            name_match = getattr(val, "name", "") == load_case
+            sw_match   = lc_lower in ("girder self weight", "self weight") \
+                         and attr == "self_weight_load_case"
+            if name_match or sw_match:
+                lc_obj = val
+                break
+
+    # 3) Generic load_case_list
+    if lc_obj is None:
+        for lc in getattr(bridge, "load_case_list", []):
+            if getattr(lc, "name", "") == load_case:
+                lc_obj = lc
+                break
+
+    if lc_obj is None:
+        logger.debug("extract_load_descriptors: load case %r not found on bridge", load_case)
+        return []
+
+    # ── Resolve load-group iterable (load_groups or loads) ────────────
+    raw_groups = getattr(lc_obj, "load_groups", None)
+    if not raw_groups:
+        raw_groups = getattr(lc_obj, "loads", None)
+    if not raw_groups:
+        logger.debug("extract_load_descriptors: lc_obj %r has no load_groups/loads", lc_obj)
+        return []
+
+    # ── Parse each load group ─────────────────────────────────────────
+    def _px(p):
+        """Return x-coordinate of a load point using common attr names."""
+        for a in ("x", "x_coord", "position"):
+            v = getattr(p, a, None)
+            if v is not None:
+                return float(v)
+        return None
+
+    def _pp(p):
+        """Return load magnitude using common attr names."""
+        for a in ("p", "load", "magnitude", "value", "force"):
+            v = getattr(p, a, None)
+            if v is not None:
+                return float(v)
+        return 0.0
+
+    loads_out = []
+    for lg in raw_groups:
+        # Support both dict wrappers and direct load objects
+        load = lg.get("load", lg) if isinstance(lg, dict) else lg
+        cname = type(load).__name__.lower()
+
+        # Collect defined point handles.
+        # ospgrillage stores points as load_point_1 … load_point_8;
+        # fall back to point1 … point4 for forward-compatibility.
+        pts = []
+        for i in range(1, 9):
+            p = getattr(load, f"load_point_{i}", None)
+            if p is None:
+                p = getattr(load, f"point{i}", None)
+            if p is not None and _pp(p) != 0.0:
+                px = _px(p)
+                if px is not None:
+                    pts.append((px, _pp(p)))
+
+        if ("line" in cname or "udl" in cname or "uniform" in cname) and len(pts) >= 2:
+            x0, p0 = pts[0]
+            x1, _  = pts[1]
+            loads_out.append({
+                "type": "line",
+                "x_start": min(x0, x1),
+                "x_end":   max(x0, x1),
+                "val": abs(p0),
+            })
+        elif ("patch" in cname or "area" in cname) and len(pts) >= 4:
+            xs_pts = [p[0] for p in pts]
+            loads_out.append({
+                "type": "line",
+                "x_start": min(xs_pts),
+                "x_end":   max(xs_pts),
+                "val": abs(pts[0][1]),
+            })
+        elif ("point" in cname or "nodal" in cname or "concentrated" in cname) and pts:
+            loads_out.append({"type": "point", "x": pts[0][0], "val": abs(pts[0][1])})
+        elif hasattr(load, "compound_load_obj_list"):
+            gc = getattr(load, "global_coord", None)
+            gx = float(getattr(gc, "x", 0.0)) if gc else 0.0
+            for sub in getattr(load, "compound_load_obj_list", []):
+                for i in range(1, 9):
+                    p = getattr(sub, f"load_point_{i}", None)
+                    if p is None:
+                        p = getattr(sub, f"point{i}", None)
+                    if p is not None and _pp(p) != 0.0:
+                        px = _px(p)
+                        if px is not None:
+                            loads_out.append({
+                                "type": "point",
+                                "x": gx + px,
+                                "val": abs(_pp(p)),
+                            })
+        else:
+            # Last-resort: look for direct x_start/x_end or equivalent
+            x0 = getattr(load, "x_start", getattr(load, "start_x", None))
+            x1 = getattr(load, "x_end",   getattr(load, "end_x",   None))
+            w  = getattr(load, "w", getattr(load, "load", getattr(load, "magnitude", None)))
+            if x0 is not None and x1 is not None:
+                loads_out.append({
+                    "type": "line",
+                    "x_start": float(x0),
+                    "x_end":   float(x1),
+                    "val": abs(float(w or 0)),
+                })
+
+    logger.debug("extract_load_descriptors: lc=%r → %d loads parsed", load_case, len(loads_out))
+    return loads_out
+
+
 # =============================================================================
 #   RENDERING AND DATA ENGINE
 # =============================================================================
@@ -386,8 +526,9 @@ class GirderGraphEngine:
 
     def _call_loads(self, load_case: str) -> list[dict]:
         """
-        Fetch load descriptors for scheme overlay directly from the bridge object.
-        Tries multiple attribute conventions used by ospgrillage load-case objects.
+        Fetch load descriptors for scheme overlay from the bridge object.
+        A hydrated ResultSnapshot (subprocess design) ships them precomputed
+        in loads_by_case; the live grillage model is parsed on the fly.
         """
         try:
             if not self._require_handler("_call_loads"):
@@ -397,141 +538,15 @@ class GirderGraphEngine:
             if not bridge:
                 return []
 
-            # ── Locate the load-case object ───────────────────────────────────
-            lc_obj = None
+            loads_by_case = getattr(bridge, "loads_by_case", None)
+            if loads_by_case is not None:
+                return list(loads_by_case.get(load_case, []))
 
-            # 1) vehicle_load_cases_list
-            for lc in getattr(bridge, "vehicle_load_cases_list", []):
-                if getattr(lc, "name", "") == load_case:
-                    lc_obj = lc
-                    break
-
-            # 2) Any *_load_case attribute on the bridge
-            if lc_obj is None:
-                lc_lower = load_case.lower()
-                for attr in dir(bridge):
-                    if not attr.endswith("_load_case"):
-                        continue
-                    val = getattr(bridge, attr, None)
-                    if val is None:
-                        continue
-                    name_match = getattr(val, "name", "") == load_case
-                    sw_match   = lc_lower in ("girder self weight", "self weight") \
-                                 and attr == "self_weight_load_case"
-                    if name_match or sw_match:
-                        lc_obj = val
-                        break
-
-            # 3) Generic load_case_list
-            if lc_obj is None:
-                for lc in getattr(bridge, "load_case_list", []):
-                    if getattr(lc, "name", "") == load_case:
-                        lc_obj = lc
-                        break
-
-            if lc_obj is None:
-                logger.debug("_call_loads: load case %r not found on bridge", load_case)
-                return []
-
-            # ── Resolve load-group iterable (load_groups or loads) ────────────
-            raw_groups = getattr(lc_obj, "load_groups", None)
-            if not raw_groups:
-                raw_groups = getattr(lc_obj, "loads", None)
-            if not raw_groups:
-                logger.debug("_call_loads: lc_obj %r has no load_groups/loads", lc_obj)
-                return []
-
-            # ── Parse each load group ─────────────────────────────────────────
-            def _px(p):
-                """Return x-coordinate of a load point using common attr names."""
-                for a in ("x", "x_coord", "position"):
-                    v = getattr(p, a, None)
-                    if v is not None:
-                        return float(v)
-                return None
-
-            def _pp(p):
-                """Return load magnitude using common attr names."""
-                for a in ("p", "load", "magnitude", "value", "force"):
-                    v = getattr(p, a, None)
-                    if v is not None:
-                        return float(v)
-                return 0.0
-
-            loads_out = []
-            for lg in raw_groups:
-                # Support both dict wrappers and direct load objects
-                load = lg.get("load", lg) if isinstance(lg, dict) else lg
-                cname = type(load).__name__.lower()
-
-                # Collect defined point handles.
-                # ospgrillage stores points as load_point_1 … load_point_8;
-                # fall back to point1 … point4 for forward-compatibility.
-                pts = []
-                for i in range(1, 9):
-                    p = getattr(load, f"load_point_{i}", None)
-                    if p is None:
-                        p = getattr(load, f"point{i}", None)
-                    if p is not None and _pp(p) != 0.0:
-                        px = _px(p)
-                        if px is not None:
-                            pts.append((px, _pp(p)))
-
-                if ("line" in cname or "udl" in cname or "uniform" in cname) and len(pts) >= 2:
-                    x0, p0 = pts[0]
-                    x1, _  = pts[1]
-                    loads_out.append({
-                        "type": "line",
-                        "x_start": min(x0, x1),
-                        "x_end":   max(x0, x1),
-                        "val": abs(p0) ,
-                    })
-                elif ("patch" in cname or "area" in cname) and len(pts) >= 4:
-                    xs_pts = [p[0] for p in pts]
-                    loads_out.append({
-                        "type": "line",
-                        "x_start": min(xs_pts),
-                        "x_end":   max(xs_pts),
-                        "val": abs(pts[0][1]),
-                    })
-                elif ("point" in cname or "nodal" in cname or "concentrated" in cname) and pts:
-                    loads_out.append({"type": "point", "x": pts[0][0], "val": abs(pts[0][1])})
-                elif hasattr(load, "compound_load_obj_list"):
-                    gc = getattr(load, "global_coord", None)
-                    gx = float(getattr(gc, "x", 0.0)) if gc else 0.0
-                    for sub in getattr(load, "compound_load_obj_list", []):
-                        for i in range(1, 9):
-                            p = getattr(sub, f"load_point_{i}", None)
-                            if p is None:
-                                p = getattr(sub, f"point{i}", None)
-                            if p is not None and _pp(p) != 0.0:
-                                px = _px(p)
-                                if px is not None:
-                                    loads_out.append({
-                                        "type": "point",
-                                        "x": gx + px,
-                                        "val": abs(_pp(p)),
-                                    })
-                else:
-                    # Last-resort: look for direct x_start/x_end or equivalent
-                    x0 = getattr(load, "x_start", getattr(load, "start_x", None))
-                    x1 = getattr(load, "x_end",   getattr(load, "end_x",   None))
-                    w  = getattr(load, "w", getattr(load, "load", getattr(load, "magnitude", None)))
-                    if x0 is not None and x1 is not None:
-                        loads_out.append({
-                            "type": "line",
-                            "x_start": float(x0),
-                            "x_end":   float(x1),
-                            "val": abs(float(w or 0)),
-                        })
-
-            logger.debug("_call_loads: lc=%r → %d loads parsed", load_case, len(loads_out))
-            return loads_out
+            return extract_load_descriptors(bridge, load_case)
 
         except Exception as exc:
             logger.warning("_call_loads(lc=%r) failed: %s", load_case, exc, exc_info=True)
             return []
-
 
     def _call_envelopes(
         self,

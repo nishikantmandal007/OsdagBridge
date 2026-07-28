@@ -343,13 +343,20 @@ class PlateGirderAnalysisResults:
     # ========================================================
     def build_grillage_connectivity(self):  # connectivity between nodes[raph for bfs]
 
-        nodes = {}
-        for n in ops.getNodeTags():
-            nodes[n] = ops.nodeCoord(n)
+        # A hydrated ResultSnapshot (subprocess design) carries the node/member
+        # maps captured in the child; the live ops domain is empty then.
+        snap_nodes = getattr(self.bridge, "captured_nodes", None)
+        if snap_nodes is not None:
+            nodes = dict(snap_nodes)
+            elements = {e: list(conn) for e, conn in self.bridge.captured_members.items()}
+        else:
+            nodes = {}
+            for n in ops.getNodeTags():
+                nodes[n] = ops.nodeCoord(n)
 
-        elements = {}
-        for e in ops.getEleTags():
-            elements[e] = ops.eleNodes(e)
+            elements = {}
+            for e in ops.getEleTags():
+                elements[e] = ops.eleNodes(e)
 
         adj = defaultdict(set)
 
@@ -363,6 +370,13 @@ class PlateGirderAnalysisResults:
             adj[n2].add(n1)
 
         return nodes, elements, adj
+
+    def _ele_nodes(self, eid):
+        """[iNode, jNode] for an element — snapshot map if hydrated, else live ops."""
+        members = getattr(self.bridge, "captured_members", None)
+        if members is not None:
+            return list(members[eid])
+        return ops.eleNodes(eid)
 
     # ========================================================
     # BFS SHORTEST PATH
@@ -930,12 +944,12 @@ class PlateGirderAnalysisResults:
                 eid_end, _, n2_end = element_map[-1]
                 
                 try:
-                    # Identify components based on element connectivity in OpenSees
-                    # ops.eleNodes(eid) returns [iNode, jNode]
-                    nodes_start = ops.eleNodes(eid_start)
+                    # Identify components based on element connectivity
+                    # _ele_nodes(eid) returns [iNode, jNode]
+                    nodes_start = self._ele_nodes(eid_start)
                     comp_ra = "Vy_i" if n1_start == nodes_start[0] else "Vy_j"
-                    
-                    nodes_end = ops.eleNodes(eid_end)
+
+                    nodes_end = self._ele_nodes(eid_end)
                     comp_rb = "Vy_j" if n2_end == nodes_end[1] else "Vy_i"
 
                     # Fetch raw values from dataset (divide by 1000 for kN)
@@ -1242,9 +1256,9 @@ class PlateGirderAnalysisResults:
             eid_e, _, n2_e = el_map[-1]
             
             try:
-                nodes_s = ops.eleNodes(eid_s)
+                nodes_s = self._ele_nodes(eid_s)
                 c_ra = "Vy_i" if n1_s == nodes_s[0] else "Vy_j"
-                nodes_e = ops.eleNodes(eid_e)
+                nodes_e = self._ele_nodes(eid_e)
                 c_rb = "Vy_j" if n2_e == nodes_e[1] else "Vy_i"
 
                 ra = float(self.ds.sel(Loadcase=load_case, Element=eid_s, Component=c_ra)["forces"]) / 1000
