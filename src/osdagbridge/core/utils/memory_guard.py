@@ -285,7 +285,6 @@ def log_live_objects(tag):
 
 # Heavy design-result attributes dropped from the bridge backend on release.
 _BRIDGE_RESULT_ATTRS = (
-    "cad_components",
     "crossbracing_design_results",
     "end_diaphragm_design_results",
     "deck_design_results",
@@ -296,6 +295,10 @@ _BRIDGE_RESULT_ATTRS = (
     # (~20 MB, tracemalloc: xarray duck_array_ops) alive on the post-release floor even
     # though grillage_model itself was replaced. Recomputed every design — safe to drop.
     "result_envelopes",
+    # Full envelope-augmented dataset and DCR engine: written every design,
+    # never read back — same retention class as result_envelopes.
+    "_results_with_envelope",
+    "_dcr_engine",
 )
 
 # Raw per-load-case record containers on the ospgrillage Results object.
