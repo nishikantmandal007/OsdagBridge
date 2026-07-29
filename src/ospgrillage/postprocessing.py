@@ -8,11 +8,38 @@ module of OpenSeesPy - this module fills in gaps to
 """
 
 import enum
+import importlib as _importlib
 import json
-import matplotlib.pyplot as plt
-import opsvis as opsv
 import numpy as np
 from typing import TYPE_CHECKING, Union
+
+
+class _LazyModule:
+    """Import a heavy module on first attribute access, then delegate to it.
+
+    ``matplotlib.pyplot`` and ``opsvis`` are only needed by the plotting
+    functions in this module; importing them eagerly pulls matplotlib (and its
+    backends) onto the import path of anyone who merely ``import ospgrillage``.
+    Assigning these proxies to module-level ``plt``/``opsv`` keeps every call
+    site (``plt.subplots(...)``, ``opsv.section_force_distribution_3d(...)``)
+    byte-for-byte identical while deferring the real import until a plot is
+    actually drawn.
+    """
+
+    __slots__ = ("_name", "_mod")
+
+    def __init__(self, name):
+        self._name = name
+        self._mod = None
+
+    def __getattr__(self, attr):
+        if self._mod is None:
+            object.__setattr__(self, "_mod", _importlib.import_module(self._name))
+        return getattr(self._mod, attr)
+
+
+plt = _LazyModule("matplotlib.pyplot")
+opsv = _LazyModule("opsvis")
 
 # if TYPE_CHECKING:
 from ospgrillage.load import ShapeFunction

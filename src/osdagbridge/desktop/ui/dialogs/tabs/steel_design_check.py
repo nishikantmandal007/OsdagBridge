@@ -201,6 +201,7 @@ def _flexure_eq_lines(pna_location: str) -> tuple[tuple[str, int, bool], ...]:
 # ---------------------------------------------------------------------------
 
 _SVG_CACHE: dict[tuple[str, int, int], bytes] = {}  # key is now (latex, display_width, fontsize)
+_SVG_CACHE_MAX = 256  # cap so repeated design cycles can't grow it without bound
 
 def _latex_to_svg(latex: str, display_width: int = 260, fontsize: int = 14) -> bytes:
     cache_key = (latex, display_width, fontsize)
@@ -234,13 +235,20 @@ def _latex_to_svg(latex: str, display_width: int = 260, fontsize: int = 14) -> b
         buf = io.BytesIO()
         fig.savefig(buf, format="svg", transparent=True,
                     bbox_inches="tight", pad_inches=pad / 72)
-        matplotlib.pyplot.close(fig)
+        # This Figure was built via mfigure.Figure() — it has no pyplot manager,
+        # so plt.close(fig) is a no-op that leaks the figure (and drags pyplot
+        # in eagerly). Tear it down directly instead.
+        fig.clear()
+        fig.set_canvas(None)
         svg_bytes = buf.getvalue()
 
     except Exception:
         logger.exception("mathtext SVG render failed for: %s", latex[:80])
         svg_bytes = b'<svg xmlns="http://www.w3.org/2000/svg" width="200" height="30"></svg>'
 
+    if len(_SVG_CACHE) >= _SVG_CACHE_MAX:
+        # Evict oldest (dict preserves insertion order) to keep the cap.
+        _SVG_CACHE.pop(next(iter(_SVG_CACHE)))
     _SVG_CACHE[cache_key] = svg_bytes
     return svg_bytes
 # ---------------------------------------------------------------------------

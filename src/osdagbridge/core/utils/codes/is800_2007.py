@@ -9,7 +9,6 @@ try:
     from osdag_core.Common import *
 except ModuleNotFoundError:
     from osdagbridge.core.utils.codes.is800_common_compat import *
-import pandas as pd
 # from osdag_core.Common import KEY_DP_FAB_SHOP
 
 
@@ -888,6 +887,7 @@ class IS800_2007(object):
 
     @staticmethod
     def cl_7_1_2_1_design_compressisive_stress_fcd_buckling_class_c():
+        import pandas as pd  # local: keep pandas off the GUI startup import path
         data = {
     200: [182.00, 182.00, 172.00, 163.00, 153.00, 142.00, 131.00, 120.00, 108.00, 97.50, 87.30, 78.20, 70.00, 62.90,
           56.60, 51.10, 46.40, 42.20, 38.50, 35.30, 32.40, 29.90, 27.60, 25.60, 23.80],

@@ -7,7 +7,6 @@ import matplotlib.colors as mcolors
 from matplotlib.ticker import FuncFormatter
 from matplotlib.ticker import MaxNLocator
 import numpy as np
-import openseespy.opensees as ops
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from mpl_toolkits.mplot3d import proj3d
 from matplotlib.text import Annotation
@@ -91,6 +90,7 @@ def _set_value_axis_tick_formatter(ax, eng_scale, value_sign: float = 1.0, use_a
 
 def build_nodes_members():
     """Build nodes and members dicts from the active openseespy model."""
+    import openseespy.opensees as ops  # local: keep openseespy off the GUI startup path
     nodes = {
         int(n): list(map(float, ops.nodeCoord(n)))
         for n in ops.getNodeTags()
@@ -1553,6 +1553,27 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
 
 def _dispose_figure(fig):
     """Tear down a manager-less figure (plt.close() is a no-op on these)."""
+    # Stop/drop any mplcursors hover state pinned on the figure. The cursor and
+    # its per-selection QTimers hold refs back to the artists, so without this
+    # the whole figure survives fig.clear() on Windows boxes with mplcursors.
+    timers = getattr(fig, "_hover_timers", None)
+    if timers:
+        for _t in list(timers.values()):
+            try:
+                _t.stop()
+            except Exception:
+                pass
+        timers.clear()
+    cursor = getattr(fig, "_custom_cursor", None)
+    if cursor is not None:
+        try:
+            cursor.remove()
+        except Exception:
+            pass
+        try:
+            del fig._custom_cursor
+        except Exception:
+            pass
     fig.clear()
     fig.set_canvas(None)
 

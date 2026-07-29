@@ -49,6 +49,17 @@ if _IS_WINDOWS:
         _UCRT = _KERNEL32 = None
 
 
+# glibc handle, loaded and typed once (None on Windows / on failure). Reloading it
+# per call — as _malloc_trim() and proc_native_mb() used to — re-runs the dlopen
+# lookup on every release/trim/measure.
+_LIBC = None
+if not _IS_WINDOWS:
+    try:
+        _LIBC = ctypes.CDLL("libc.so.6")
+    except Exception:
+        _LIBC = None
+
+
 def _malloc_trim():
     # Hand free heap blocks back to the OS. gc.collect() frees objects into the allocator's
     # arena but does NOT return memory to the OS — this does. Best-effort on both platforms.
@@ -60,8 +71,8 @@ def _malloc_trim():
             heaps = (ctypes.c_void_p * _KERNEL32.GetProcessHeaps(0, None))()
             for h in heaps[: _KERNEL32.GetProcessHeaps(len(heaps), heaps)]:
                 _KERNEL32.HeapCompact(h, 0)
-        else:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        elif _LIBC is not None:
+            _LIBC.malloc_trim(0)
     except Exception:
         pass
 
@@ -126,12 +137,11 @@ def proc_native_mb():
     # glibc allocator (in-use, mmap) in MB via mallinfo2; (None, None) off glibc / on failure.
     # Windows has no safe equivalent (HeapWalk needs HeapLock); the commit charge from
     # proc_mem_mb() is the leak-tracking floor metric there instead.
-    if _IS_WINDOWS:
+    if _IS_WINDOWS or _LIBC is None:
         return None, None
     try:
-        libc = ctypes.CDLL("libc.so.6")
-        libc.mallinfo2.restype = _Mallinfo2
-        mi = libc.mallinfo2()
+        _LIBC.mallinfo2.restype = _Mallinfo2
+        mi = _LIBC.mallinfo2()
         return mi.uordblks / 1024.0 / 1024.0, mi.hblkhd / 1024.0 / 1024.0
     except Exception:
         return None, None
@@ -397,6 +407,12 @@ class OpsMemoryGuard:
             elif isinstance(container, list) and container:
                 del container[:]
                 cleared += 1
+        # Results.result caches the complete pre-envelope xarray Dataset
+        # (60-200 MB). It is write-only (no reader outside the vendored lib),
+        # so drop it here rather than let it ride through stages 5-8.
+        if getattr(results, "result", None) is not None:
+            results.result = None
+            cleared += 1
         gc.collect()
         # Hand the freed arena back to the OS so the resident figure actually drops.
         # No _trim_working_set() here: this runs mid-design, and forcing the live analysis

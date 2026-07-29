@@ -48,6 +48,10 @@ class LogDock(QWidget):
         self.log_display.setObjectName("textEdit")
         self.log_display.setReadOnly(True)
         self.log_display.setOverwriteMode(True)
+        # Long design runs stream thousands of lines; without these the
+        # document (plus its undo stack) grows unbounded until unlock.
+        self.log_display.setUndoRedoEnabled(False)
+        self.log_display.document().setMaximumBlockCount(5000)
         layout.addWidget(self.log_display)
 
         # Add init log text matching

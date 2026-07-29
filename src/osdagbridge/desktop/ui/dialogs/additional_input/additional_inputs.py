@@ -2963,18 +2963,23 @@ class AdditionalInputs(QDialog):
         from PySide6.QtWidgets import QDialog
         current_list = self.working_input_dict.get(KEY_LL_CUSTOM_VEHICLES)
         dlg = CustomVehicleDialog(self)
-        if existing:
-            dlg.load_vehicle_data(existing)
-        if dlg.exec() == QDialog.Accepted:
-            result  = dlg.vehicle_data
-            updated = list(current_list)
-            if existing and existing in updated:
-                updated[updated.index(existing)] = result
-            else:
-                updated.append(result)
-            self._on_field_edited(KEY_LL_CUSTOM_VEHICLES, updated)
-            if widget:
-                widget.update(updated)
+        # Parented to this long-lived dialog, so it must be deleted explicitly
+        # or every open permanently adds a full widget tree.
+        try:
+            if existing:
+                dlg.load_vehicle_data(existing)
+            if dlg.exec() == QDialog.Accepted:
+                result  = dlg.vehicle_data
+                updated = list(current_list)
+                if existing and existing in updated:
+                    updated[updated.index(existing)] = result
+                else:
+                    updated.append(result)
+                self._on_field_edited(KEY_LL_CUSTOM_VEHICLES, updated)
+                if widget:
+                    widget.update(updated)
+        finally:
+            dlg.deleteLater()
 
     def _on_add_custom_combination(self, existing=None, widget=None):  # on_change: opens Load Combination dialog and appends or updates the combination list
         from osdagbridge.desktop.ui.dialogs.additional_input.dialogs.load_combination_dialog import LoadCombinationDialog
@@ -2986,17 +2991,21 @@ class AdditionalInputs(QDialog):
             load_combo_items=current_list,
             parent=self,
         )
-        if dlg.exec() == QDialog.Accepted:
-            result  = dlg._collect()
-            updated = list(current_list)
-            if existing and existing in updated:
-                idx          = updated.index(existing)
-                updated[idx] = result
-            else:
-                updated.append(result)
-            self._on_field_edited(KEY_LC_COMBINATIONS, updated)
-            if widget:
-                widget.update(updated)
+        # Parented to this long-lived dialog — delete explicitly after use.
+        try:
+            if dlg.exec() == QDialog.Accepted:
+                result  = dlg._collect()
+                updated = list(current_list)
+                if existing and existing in updated:
+                    idx          = updated.index(existing)
+                    updated[idx] = result
+                else:
+                    updated.append(result)
+                self._on_field_edited(KEY_LC_COMBINATIONS, updated)
+                if widget:
+                    widget.update(updated)
+        finally:
+            dlg.deleteLater()
 
     def _compute_seismic_values(self, working_input_dict: dict) -> dict:  # compute: derives Ah, Av and spectral coefficients from IRC 6 seismic inputs
         from osdagbridge.core.utils.codes.irc6_2017 import IRC6_2017

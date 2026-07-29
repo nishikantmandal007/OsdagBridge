@@ -1,6 +1,3 @@
-import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-
 import copy
 from osdagbridge.desktop.ui.dialogs.generate_results_values_builder import (
     resolve_bridge_config_summary,resolve_material_properties_steel
@@ -1323,6 +1320,11 @@ class ExportTablePage(QWidget):
 
         if not path:
             return
+
+        # openpyxl is only needed for this export — import lazily so it doesn't
+        # cost ~36 MB at every app startup (this dialog is rarely opened).
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
         GREEN_HEX  = "FF90AF13"
         WHITE_HEX  = "FFFFFFFF"

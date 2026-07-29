@@ -5,12 +5,31 @@ Module for IRC 22:2014 bridge design clauses.
 
 """
 
-try:
-    from osdag_core.utils.common.is800_2007 import IS800_2007
-except ModuleNotFoundError:
-    from osdagbridge.core.utils.codes.is800_2007 import IS800_2007
 from osdagbridge.core.utils.codes.keyfile import *
 import math
+
+
+class _LazyIS800_2007:
+    """Resolve IS800_2007 on first attribute access, not at module import.
+
+    osdag_core's is800_2007 pulls pandas (~30 MB) transitively; every call site
+    here is ``IS800_2007.<method>(...)`` inside a method body, so deferring the
+    import keeps pandas off the GUI startup path. The try/except selection is
+    preserved exactly — behaviour-identical, just lazy.
+    """
+    _cls = None
+
+    def __getattr__(self, attr):
+        if _LazyIS800_2007._cls is None:
+            try:
+                from osdag_core.utils.common.is800_2007 import IS800_2007 as _cls
+            except ModuleNotFoundError:
+                from osdagbridge.core.utils.codes.is800_2007 import IS800_2007 as _cls
+            _LazyIS800_2007._cls = _cls
+        return getattr(_LazyIS800_2007._cls, attr)
+
+
+IS800_2007 = _LazyIS800_2007()
 
 class IRC22_2014:
 

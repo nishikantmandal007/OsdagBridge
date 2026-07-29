@@ -45,8 +45,13 @@ _register_conda_dll_directories()
 
 import numpy as np  # re-exported: tests and users access ospgrillage.np
 import openseespy.opensees as ops  # re-exported: tests and users access ospgrillage.ops
-import opsvis as opsv  # used internally by postprocessing (section_force_distribution_3d)
-import matplotlib.pyplot as plt  # re-exported: users access ospgrillage.plt
+
+# NOTE: ``opsvis`` and ``matplotlib.pyplot`` are intentionally NOT imported here.
+# They pull matplotlib (+ backends) onto the import path of every consumer that
+# merely ``import ospgrillage`` — a large startup cost paid even when no plot is
+# ever drawn. They remain reachable as ``ospgrillage.opsv`` / ``ospgrillage.plt``
+# via the lazy ``__getattr__`` below (imported+cached on first access), so the
+# public re-exports behave exactly as before.
 from ospgrillage.utils import *
 from ospgrillage.mesh import *
 from ospgrillage.load import *
@@ -117,19 +122,24 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compatible lazy access for deprecated re-exports
+# Lazy access for the heavy plotting re-exports
 # ---------------------------------------------------------------------------
-# Hide opsv from the public namespace — it is imported above for internal use
-# by postprocessing.py but should not be accessed as og.opsv by users.
+# ``ospgrillage.plt`` and ``ospgrillage.opsv`` remain part of the public surface
+# (used by og.plot_model / og.plt.gcf()), but matplotlib.pyplot and opsvis are
+# only imported the first time one of them is accessed, then cached into the
+# module namespace so subsequent lookups skip this hook. Behaviour is identical
+# to the previous eager re-exports (no warning) — just deferred.
 def __getattr__(name):
+    if name == "plt":
+        import matplotlib.pyplot as _plt
+
+        globals()["plt"] = _plt
+        return _plt
     if name == "opsv":
-        _warnings.warn(
-            "og.opsv is deprecated — use og.plot_model() for mesh visualisation. "
-            "Direct opsv access will be removed in a future version.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return opsv
+        import opsvis as _opsv
+
+        globals()["opsv"] = _opsv
+        return _opsv
     if name == "opsplt":
         _warnings.warn(
             "og.opsplt is deprecated — use og.plot_model() for mesh visualisation. "

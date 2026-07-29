@@ -738,8 +738,13 @@ class PlateGirderBridge:
             
             # Stage 4G: Structural Analysis
             dataset = self._run_stage("4G", self._reanalyze_with_dedup)
-            dataset = self.create_envelope_load_case(dataset)
+            # Drop the ~50-per-vehicle moving increment cases BEFORE enveloping.
+            # Envelope groups come only from ULS/SLS combination names (never
+            # "Moving " cases — see create_envelope_load_case), so the result is
+            # identical, but the envelope reduction now runs over the smaller
+            # base dataset — peak falls from ~2x the full dataset to ~1.33x kept.
             dataset = self._drop_moving_increment_cases(dataset)
+            dataset = self.create_envelope_load_case(dataset)
 
             # Drop the raw ospgrillage per-load-case records as soon as the
             # deduplicated dataset is cached: everything downstream (design checks,
@@ -2991,8 +2996,7 @@ class PlateGirderBridge:
                 from osdagbridge.core.utils.connect import (
                     design_dict_struts_bolted,
                     design_dict_tension_bolted,
-                    design_pool,
-                    run_calculation,
+                    run_member_design_jobs,
                 )
                 jobs = []
                 for member, L_mm, t_key, c_key in (
@@ -3011,19 +3015,13 @@ class PlateGirderBridge:
                         jobs.append((pair, member, "compression", d))
 
                 if jobs:
-                    cpu_count = __import__("os").cpu_count() or 4
-                    max_workers = min(cpu_count, len(jobs))
-                    # spawn-context pool: forking under the design worker thread
-                    # deadlocks (see connect.design_pool).
-                    with design_pool(max_workers) as executor:
-                        futures = {executor.submit(run_calculation, j[3]): j for j in jobs}
-                        for future, (p, member, force_type, _) in futures.items():
-                            try:
-                                res = future.result()
-                            except Exception as exc:
-                                print(f"  [EndDiaphragm] SKIP {p} {member} {force_type}: {exc}")
-                                res = None
-                            pair_designs.setdefault(p, {}).setdefault(member, {})[force_type] = res
+                    # Single dispatch (serial in-process for this small batch; the
+                    # capped pool is used only for large batches on forkserver).
+                    # This replaces the per-pair pool that was previously created
+                    # and torn down inside this loop.
+                    keyed_jobs = [((p, member, force_type), d) for (p, member, force_type, d) in jobs]
+                    for (p, member, force_type), res in run_member_design_jobs(keyed_jobs).items():
+                        pair_designs.setdefault(p, {}).setdefault(member, {})[force_type] = res
 
                 # Fetch selected designations
                 member_designs = pair_designs.get(pair, {})

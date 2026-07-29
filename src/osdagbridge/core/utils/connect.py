@@ -113,6 +113,80 @@ def design_pool(max_workers: int) -> ProcessPoolExecutor:
     return ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx)
 
 
+# Batches at or below this size run serially in-process, as does EVERY batch on a
+# non-forkserver platform (Windows/macOS spawn), where a worker costs ~0.46 s +
+# ~90 MB to spawn (it imports the design stack) — there, serial is decisively
+# faster AND lighter, and can't fork under the Qt/design QThread.
+#
+# On Linux/forkserver the calculus differs: the preloaded server makes each fork
+# nearly free and workers COW-share the parent's pages, so a capped pool is both
+# faster and no heavier than serial for the real stage-7 batch. Measured on the
+# 12-job transverse batch (25 m Custom design): pool 1.60 s vs serial 1.96 s at an
+# identical ~312 MB peak RSS. Only genuinely tiny forkserver batches (≤4) stay
+# serial, where the per-round overhead would outweigh 4-way parallelism.
+_SERIAL_JOB_THRESHOLD = 4
+
+
+def run_member_design_jobs(
+    jobs: List[tuple], quiet: bool = True
+) -> Dict[Any, Any]:
+    """Dispatch a batch of member-design jobs, choosing serial vs pool by size.
+
+    Parameters
+    ----------
+    jobs : list of ``(key, design_dict)``
+        ``key`` is any hashable label the caller uses to reassemble results
+        (e.g. ``(pair, member, force_type)``). ``design_dict`` is a run_calculation
+        input.
+    quiet : bool
+        Suppress osdag_core stdout/logging inside each design.
+
+    Returns
+    -------
+    dict  ``{key: output_dict_or_None}`` — one entry per job. A job that raises is
+    recorded as ``None`` (mirrors the previous per-site pool behaviour).
+
+    Small batches — or any platform without a cheap forkserver (Windows/spawn) —
+    run **serially in the current process**: no pool spawn/import overhead, lower
+    peak memory, and no fork taken under the Qt event loop / design QThread (the
+    stage-7 deadlock the pool was originally introduced to dodge). Large batches on
+    a forkserver platform still use the memory-capped :func:`design_pool`.
+    """
+    results: Dict[Any, Any] = {}
+    if not jobs:
+        return results
+
+    import multiprocessing
+    # forkserver is POSIX-only; on spawn platforms a worker costs as much as the
+    # whole batch, so serial is the right default there regardless of size.
+    has_forkserver = "forkserver" in multiprocessing.get_all_start_methods()
+
+    if len(jobs) <= _SERIAL_JOB_THRESHOLD or not has_forkserver:
+        for key, design_dict in jobs:
+            try:
+                results[key] = run_calculation(design_dict, quiet)
+            except Exception as exc:  # noqa: BLE001 — mirror prior SKIP-on-error semantics
+                print(f"  [MemberDesign] SKIP {key}: {exc}")
+                results[key] = None
+        return results
+
+    # Large batch on a forkserver platform: capped pool keeps peak memory bounded.
+    cpu_count = os.cpu_count() or 4
+    max_workers = min(4, cpu_count, len(jobs))
+    with design_pool(max_workers) as executor:
+        futures = {
+            executor.submit(run_calculation, design_dict, quiet): key
+            for key, design_dict in jobs
+        }
+        for future, key in futures.items():
+            try:
+                results[key] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [MemberDesign] SKIP {key}: {exc}")
+                results[key] = None
+    return results
+
+
 def run_parallel_designs(design_dicts: List[Dict[str, Any]], quiet: bool = True) -> List[Dict[str, Any]]:
     cpu_count = os.cpu_count() or 4
     max_workers = min(cpu_count, len(design_dicts))

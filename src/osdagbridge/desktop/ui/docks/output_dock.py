@@ -706,6 +706,7 @@ class OutputDock(QWidget):
             # Section 6.3 — Cross Bracing Detail: 4 pictures from the crossbracing
             # tab. The dialog's __init__ auto-loads data from the backend and
             # populates these widgets; we just resize + grab each, same as above.
+            _tmd = None
             try:
                 from PySide6.QtCore import QBuffer, QIODevice
                 from osdagbridge.desktop.ui.dialogs.transverse_member_design import TransverseMemberDesign
@@ -739,9 +740,13 @@ class OutputDock(QWidget):
                 _grab_cb(_tmd._section_previews.get('ed_End Diaphragm'),'ed_bracing',      300, 300)  # bracing section
                 _grab_cb(_tmd._section_previews.get('ed_Top Chord'),    'ed_top_chord',    300, 300)  # top chord section
                 _grab_cb(_tmd._section_previews.get('ed_Bottom Chord'), 'ed_bottom_chord', 300, 300)  # bottom chord section
-                _tmd.deleteLater()
             except Exception as exc:
                 logger.warning("Could not capture cross bracing / end diaphragm figures: %s", exc)
+            finally:
+                # Delete even if a grab raised partway through — otherwise the
+                # dialog (which auto-loaded the full backend result set) leaks.
+                if _tmd is not None:
+                    _tmd.deleteLater()
 
             # Analysis envelope plot: live plot widget → temp PNG → bytes → deleted.
             # Switch the central area to the plots view first (like the CAD does) so

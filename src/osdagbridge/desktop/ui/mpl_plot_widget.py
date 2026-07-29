@@ -23,6 +23,7 @@ from osdagbridge.core.bridge_types.plate_girder.plot_generator import (
     build_figure_grillage,
     _add_node_number_labels,
     _add_element_number_labels,
+    _dispose_figure,
     FORCE_MAP,
     DISP_MAP,
 )
@@ -351,6 +352,7 @@ class MplPlotWidget(QWidget):
             self._summary_overlay.hide()
         if hasattr(self, "_navcube"):
             self._navcube.hide()
+            self._navcube_sync.pause()
 
     def _disconnect_output_dock_signals(self):
         """Disconnect all signals wired in link_output_dock() to prevent dangling refs."""
@@ -633,9 +635,11 @@ class MplPlotWidget(QWidget):
                 self._navcube.mark_ready()
             self._navcube.show()
             self._navcube.raise_()
+            self._navcube_sync.resume()
             self._navcube_sync.force_sync()
         else:
             self._navcube.hide()
+            self._navcube_sync.pause()
 
     def _resize_navcube(self):
         """Scale NavCube to 8% of the shorter canvas edge, DPI-aware. (mirrors CustomViewer3d)"""
@@ -900,9 +904,9 @@ class MplPlotWidget(QWidget):
         if old is not None and old is not fig:
             # These figures have no pyplot manager, so plt.close() would be a
             # silent no-op — tear down the artist/transform graph explicitly
+            # (this also stops any mplcursors hover timers pinned on the figure)
             # or every design retains its full 3-D figure.
-            old.clear()
-            old.set_canvas(None)
+            _dispose_figure(old)
         self._canvas.figure = fig
         fig.set_canvas(self._canvas)
         # Canvas callbacks live on the figure (figure._canvas_callbacks), so
@@ -1420,17 +1424,18 @@ class MplPlotWidget(QWidget):
         if hasattr(ax, 'elev') and hasattr(ax, 'azim'):
             self._auto_rotate_angle = ax.azim
         
-        # Create timer for smooth animation
-        self._auto_rotate_timer = QTimer(self)
-        self._auto_rotate_timer.setInterval(1000 // self._AUTO_ROTATE_FPS)
-        self._auto_rotate_timer.timeout.connect(self._auto_rotate_step)
+        # One timer for the widget's lifetime — a fresh QTimer(self) per start
+        # leaks the previous C++ timer as a permanent child of the widget.
+        if self._auto_rotate_timer is None:
+            self._auto_rotate_timer = QTimer(self)
+            self._auto_rotate_timer.setInterval(1000 // self._AUTO_ROTATE_FPS)
+            self._auto_rotate_timer.timeout.connect(self._auto_rotate_step)
         self._auto_rotate_timer.start()
 
     def _stop_auto_rotate(self):
         """Stop continuous rotation."""
         if self._auto_rotate_timer is not None:
             self._auto_rotate_timer.stop()
-            self._auto_rotate_timer = None
 
     def _auto_rotate_step(self):
         """Advance rotation by a small amount for smooth spinning."""

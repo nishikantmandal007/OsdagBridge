@@ -753,7 +753,9 @@ class CustomViewer3d(qtViewer3d):
             except Exception:
                 pass
 
-        state["auto_rotate"] = self._auto_rotate_timer is not None
+        state["auto_rotate"] = (
+            self._auto_rotate_timer is not None and self._auto_rotate_timer.isActive()
+        )
         self._stop_auto_rotate()
 
         try:
@@ -1102,16 +1104,19 @@ class CustomViewer3d(qtViewer3d):
         except Exception:
             pass
 
-        self._auto_rotate_timer = QTimer(self)
-        self._auto_rotate_timer.setInterval(1000 // self._AUTO_ROTATE_FPS)
-        self._auto_rotate_timer.timeout.connect(self._auto_rotate_step)
+        # One timer for the widget's lifetime: this start/stop pair runs every
+        # design and unlock (via CADSafetyGuard), and a fresh QTimer(self) per
+        # start leaks the previous C++ timer as a permanent child.
+        if self._auto_rotate_timer is None:
+            self._auto_rotate_timer = QTimer(self)
+            self._auto_rotate_timer.setInterval(1000 // self._AUTO_ROTATE_FPS)
+            self._auto_rotate_timer.timeout.connect(self._auto_rotate_step)
         self._auto_rotate_timer.start()
 
     def _stop_auto_rotate(self) -> None:
         """Kill the turntable timer if running."""
         if self._auto_rotate_timer is not None:
             self._auto_rotate_timer.stop()
-            self._auto_rotate_timer = None
 
     def _auto_rotate_step(self) -> None:
         """Apply one frame of horizontal rotation.

@@ -58,9 +58,18 @@ class MatplotlibNavCubeSync:
 
         navicube.viewOrientationRequested.connect(self._on_orientation_requested)
 
-        self._tmr = QTimer()
+        # Parented to the canvas so the timer dies with the widget; started
+        # only while the NavCube is visible (resume()/pause()) instead of
+        # polling 20×/s for the whole app lifetime.
+        self._tmr = QTimer(canvas)
         self._tmr.timeout.connect(self._tick)
-        self._tmr.start(self._TICK_MS)
+
+    def resume(self):
+        if not self._tmr.isActive():
+            self._tmr.start(self._TICK_MS)
+
+    def pause(self):
+        self._tmr.stop()
 
     def set_interaction_active(self, active: bool):
         if self._navicube:

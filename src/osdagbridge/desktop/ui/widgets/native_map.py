@@ -25,11 +25,52 @@ INDIA_BOUNDS = {
     "east": 97.5,   # Eastern-most longitude
 }
 
+@lru_cache(maxsize=4)
+def _parse_geojson_shapes(path_str):
+    """Parse a GeoJSON boundary file into render-ready shapes, once per path.
+
+    The India boundary file is ~6.4 MB; parsing it on every dialog open costs
+    20–40 MB of transient garbage. Cached at module level so the parsed
+    shapes (immutable tuples) are shared across every ProjectLocationDialog.
+    """
+    geojson_path = Path(path_str)
+    if not geojson_path.exists():
+        return ()
+
+    try:
+        with geojson_path.open("r", encoding="utf-8") as file_obj:
+            data = json.load(file_obj)
+    except (OSError, json.JSONDecodeError):
+        return ()
+
+    shapes = []
+    for feature in data.get("features", []):
+        geometry = feature.get("geometry") or {}
+        geom_type = geometry.get("type")
+        coords = geometry.get("coordinates", [])
+
+        if geom_type == "Polygon":
+            for ring in coords:
+                shapes.append((ring, True))
+        elif geom_type == "MultiPolygon":
+            for polygon in coords:
+                for ring in polygon:
+                    shapes.append((ring, True))
+        elif geom_type == "LineString":
+            shapes.append((coords, False))
+        elif geom_type == "MultiLineString":
+            for line in coords:
+                shapes.append((line, False))
+    return tuple(shapes)
+
+
 class NativeMapWidget(QWidget):
     """
-    A native tile-based map widget that fetches OpenStreetMap tiles 
+    A native tile-based map widget that fetches OpenStreetMap tiles
     and renders them using QPainter. this avoids QWebEngineView dependency.
     """
+
+    _PIXMAP_CACHE_MAX = 200  # cap in-memory tile cache so panning can't grow it forever
     locationSelected = Signal(float, float)  # Emits (lat, lon) on click
 
     def __init__(self, parent=None):
@@ -184,41 +225,18 @@ class NativeMapWidget(QWidget):
             data = reply.readAll()
             pixmap = QPixmap()
             pixmap.loadFromData(data)
+            # Bound the in-memory tile cache: evict oldest (FIFO) once over the
+            # cap so panning across the country can't accumulate tiles forever.
+            if len(self.pixmap_cache) >= self._PIXMAP_CACHE_MAX:
+                self.pixmap_cache.pop(next(iter(self.pixmap_cache)))
             self.pixmap_cache[url] = pixmap
             self.update() # Trigger repaint
         reply.deleteLater()
 
     def load_geojson(self, path):
         """Load GeoJSON boundaries (FeatureCollection) for rendering."""
-        self._geojson_shapes = []
-        geojson_path = Path(path)
-        if not geojson_path.exists():
-            return
-
-        try:
-            with geojson_path.open("r", encoding="utf-8") as file_obj:
-                data = json.load(file_obj)
-        except (OSError, json.JSONDecodeError):
-            return
-
-        for feature in data.get("features", []):
-            geometry = feature.get("geometry") or {}
-            geom_type = geometry.get("type")
-            coords = geometry.get("coordinates", [])
-
-            if geom_type == "Polygon":
-                for ring in coords:
-                    self._geojson_shapes.append((ring, True))
-            elif geom_type == "MultiPolygon":
-                for polygon in coords:
-                    for ring in polygon:
-                        self._geojson_shapes.append((ring, True))
-            elif geom_type == "LineString":
-                self._geojson_shapes.append((coords, False))
-            elif geom_type == "MultiLineString":
-                for line in coords:
-                    self._geojson_shapes.append((line, False))
-
+        # Parsed once and shared across dialog opens (see _parse_geojson_shapes).
+        self._geojson_shapes = _parse_geojson_shapes(str(Path(path)))
         self.update()
 
     def draw_geojson(self, painter: QPainter, view_x: float, view_y: float):

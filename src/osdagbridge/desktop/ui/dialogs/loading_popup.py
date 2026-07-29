@@ -185,6 +185,8 @@ class AnalysisProgressDialog(QDialog):
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
+        self._log.setUndoRedoEnabled(False)
+        self._log.document().setMaximumBlockCount(2000)
         self._log.setFont(QFont("Courier New", 8))
         self._log.setStyleSheet(f"""
             QTextEdit {{
@@ -391,6 +393,15 @@ class LoadingDialogManager:
                     self.process.terminate()  # Force terminate if still running
                 self.process = None
                 self.stop_event = None
+                # Tear the queue's feeder thread + pipe down explicitly. Without
+                # this the background feeder thread and OS pipe handles linger
+                # (and can block) per design cycle before GC gets to them.
+                if self.label_queue is not None:
+                    try:
+                        self.label_queue.cancel_join_thread()
+                        self.label_queue.close()
+                    except Exception:
+                        pass
                 self.label_queue = None
         else:
             # Linux in-process mode: just hide the dialog

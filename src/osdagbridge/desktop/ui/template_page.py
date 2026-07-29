@@ -14,7 +14,8 @@ from osdagbridge.desktop.ui.docks.cad_dual_view import BridgeDualCADWidget
 from osdagbridge.desktop.ui.dialogs.additional_input.additional_inputs import AdditionalInputs
 from osdagbridge.desktop.ui.dialogs.custom_messagebox import CustomMessageBox, MessageBoxType
 from osdagbridge.desktop.ui.dialogs.loading_popup import LoadingDialogManager
-from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
+# CAD3DWindow pulls in the OCC (pythonocc) stack (~84 MB) — imported lazily at
+# its construction site below so it stays off the startup import path.
 
 from osdagbridge.core.bridge_types.plate_girder.ui_fields import FrontendData
 from osdagbridge.core.bridge_types.plate_girder.defaults import BASIC_INPUT_DICT, solve_extend_basic_input_dict
@@ -353,7 +354,8 @@ class CustomWindow(QWidget):
         )
         self.cad_log_splitter.addWidget(self.cad_comp_widget)
 
-        # from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
+        # Lazy import: keeps the OCC stack off the startup path (see module top).
+        from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
         # 3D CAD placeholder (mutually exclusive with dual view + plots)
         self.cad_3d_widget = CAD3DWindow()
         self.cad_3d_widget.setVisible(False)
@@ -1346,9 +1348,14 @@ class CustomWindow(QWidget):
                 current_step += 1
             else:
                 timer.stop()
+                timer.deleteLater()
                 if on_finished:
                     on_finished()
 
+        prev = getattr(self, "_splitter_anim", None)
+        if prev is not None:
+            prev.stop()
+            prev.deleteLater()
         timer = QTimer(self)
         timer.timeout.connect(update_step)
         timer.start(interval)
@@ -1385,6 +1392,12 @@ class CustomWindow(QWidget):
         from PySide6.QtWidgets import QDialog, QApplication
         from PySide6.QtCore import Qt
         import sys, os, traceback
+
+        # One report at a time: rebinding _report_thread while the previous
+        # thread still runs destroys a live QThread (hard abort).
+        if getattr(self, "_report_running", False):
+            bridge_logger.warning("A report is already being generated — please wait for it to finish.")
+            return
 
         try:
             dialog = ReportOptionsDialog(parent=self)
@@ -1456,6 +1469,13 @@ class CustomWindow(QWidget):
             def _on_done(result):
                 print(f"[REPORT-DEBUG] _on_done called, result type = {type(result).__name__}")
                 QApplication.restoreOverrideCursor()
+
+                # Release the report payload: the worker held cad_generator with
+                # up to ~16 PNG grabs plus the CAD generator's shapes — without
+                # this they stay pinned on the window until the next report.
+                self._report_running = False
+                if isinstance(cad_generator, dict):
+                    cad_generator.get('figure_data', {}).clear()
 
                 if isinstance(result, Exception):
                     err = ''.join(
@@ -1538,12 +1558,24 @@ class CustomWindow(QWidget):
             self._report_worker.moveToThread(
                 self._report_thread)
             
+            def _release_report_refs():
+                # Runs after the thread's event loop has ended, so dropping the
+                # wrapper references cannot destroy a live QThread.
+                self._report_running = False
+                self._report_worker = None
+                self._report_catcher = None
+                self._report_thread = None
+
             self._report_catcher.catch.connect(_on_done)
             self._report_worker.finished.connect(self._report_catcher.catch)
             self._report_worker.finished.connect(self._report_thread.quit)
-            
+            self._report_thread.finished.connect(self._report_worker.deleteLater)
+            self._report_thread.finished.connect(self._report_thread.deleteLater)
+            self._report_thread.finished.connect(_release_report_refs)
+
             self._report_thread.started.connect(
                 self._report_worker.run)
+            self._report_running = True
             self._report_thread.start()
 
         except Exception:
@@ -1573,6 +1605,12 @@ class CustomWindow(QWidget):
             cad = getattr(self, "cad_3d_widget", None)
             if cad is not None and hasattr(cad, "cleanup"):
                 cad.cleanup()
+        except Exception:
+            pass
+        try:
+            sync = getattr(getattr(self, "plots_widget", None), "_navcube_sync", None)
+            if sync is not None:
+                sync.teardown()
         except Exception:
             pass
         # Release the OpenSeesPy native domain + cached datasets on shutdown (via OpsMemoryGuard).

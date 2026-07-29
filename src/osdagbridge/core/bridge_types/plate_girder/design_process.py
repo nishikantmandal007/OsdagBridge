@@ -31,8 +31,14 @@ from osdagbridge.core.utils.logger import bridge_logger
 _CANCEL_KILL_GRACE_S = 20.0
 
 # Imported by the forkserver server so children fork with the full analysis
-# stack (ospgrillage / openseespy / xarray) already loaded.
-_PRELOAD_MODULE = "osdagbridge.core.bridge_types.plate_girder.plategirderbridge"
+# stack (ospgrillage / openseespy / xarray) already loaded. ospgrillage is
+# listed explicitly because analyser.py now imports it lazily (to keep it off
+# the GUI startup path) — without this the forked children would each re-import
+# the ~100 MB stack on first use instead of inheriting it from the server.
+_PRELOAD_MODULES = [
+    "ospgrillage",
+    "osdagbridge.core.bridge_types.plate_girder.plategirderbridge",
+]
 
 
 @dataclass
@@ -74,6 +80,33 @@ class _ChildStdoutRedirector:
     def __init__(self, original):
         self._original = original
         self._buffer = []
+
+    # --- text-stream interface -------------------------------------------------
+    # Child code (e.g. designer.py / connect.py) inspects sys.stdout as a real
+    # text stream at import time — reading .encoding and, on Windows, calling
+    # .reconfigure(). We buffer utf-8 text, so report utf-8 and make reconfigure a
+    # no-op instead of raising AttributeError and aborting the whole design.
+    @property
+    def encoding(self):
+        return getattr(self._original, "encoding", None) or "utf-8"
+
+    @property
+    def errors(self):
+        return getattr(self._original, "errors", None) or "replace"
+
+    def reconfigure(self, *args, **kwargs):
+        return None
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def fileno(self):
+        if self._original is not None:
+            return self._original.fileno()
+        raise OSError("_ChildStdoutRedirector has no fileno")
 
     def write(self, string):
         if self._original is not None:
@@ -163,7 +196,7 @@ def _get_mp_context():
     if _mp_ctx is None:
         try:
             ctx = multiprocessing.get_context("forkserver")
-            ctx.set_forkserver_preload([_PRELOAD_MODULE])
+            ctx.set_forkserver_preload(_PRELOAD_MODULES)
             _mp_ctx = ctx
         except ValueError:
             _mp_ctx = multiprocessing.get_context("spawn")

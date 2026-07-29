@@ -132,12 +132,33 @@ EXAMPLE USAGE
     results.run_interactive_viewer()
 """
 
+# Deferred annotations: the `-> pd.DataFrame` return hints below become strings
+# and are never evaluated, so pandas can stay a lazy proxy that only imports on
+# first real use — keeping it (and openseespy) off the GUI startup import path.
+from __future__ import annotations
+
+import importlib as _importlib
 import math
 from collections import defaultdict, deque
-import openseespy.opensees as ops
-import pandas as pd
 from osdagbridge.core.utils.common import kN, m, m2
 from osdagbridge.core.utils.codes.irc6_2017 import IRC6_2017
+
+
+class _LazyModule:
+    """Import a heavy module on first attribute access, not at module load."""
+    __slots__ = ("_name", "_mod")
+
+    def __init__(self, name):
+        self._name = name
+        self._mod = None
+
+    def __getattr__(self, attr):
+        if self._mod is None:
+            self._mod = _importlib.import_module(self._name)
+        return getattr(self._mod, attr)
+
+
+pd = _LazyModule("pandas")
 
 
 class PlateGirderAnalysisResults:
@@ -350,6 +371,7 @@ class PlateGirderAnalysisResults:
             nodes = dict(snap_nodes)
             elements = {e: list(conn) for e, conn in self.bridge.captured_members.items()}
         else:
+            import openseespy.opensees as ops  # local: keep openseespy off GUI startup
             nodes = {}
             for n in ops.getNodeTags():
                 nodes[n] = ops.nodeCoord(n)
@@ -376,6 +398,7 @@ class PlateGirderAnalysisResults:
         members = getattr(self.bridge, "captured_members", None)
         if members is not None:
             return list(members[eid])
+        import openseespy.opensees as ops  # local: keep openseespy off GUI startup
         return ops.eleNodes(eid)
 
     # ========================================================

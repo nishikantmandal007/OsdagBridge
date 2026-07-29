@@ -84,6 +84,22 @@ def _format_ops_cmd(name: str, args: tuple, kwargs: dict) -> str:
     return f"ops.{name}({', '.join(parts)})\n"
 
 
+def _to_float64_or_object(nested_list):
+    """Return ``nested_list`` as a packed float64 array when it is rectangular.
+
+    Beam-only response rows are uniform-length (every node has the same number of
+    displacement components, every beam element the same force components), so the
+    result is a dense numeric array — much lighter to retain than an ``object``
+    array of Python lists, and the cast is lossless. Ragged data (mixed shell/beam
+    rows) raises inside ``np.array(..., dtype=float64)`` and falls back to the
+    original object array, preserving the previous behaviour exactly.
+    """
+    try:
+        return np.array(nested_list, dtype=np.float64)
+    except (ValueError, TypeError):
+        return np.array(nested_list, dtype=object)
+
+
 class _OpsProxy:
     """
     Proxy for openseespy.opensees that handles dual-mode dispatch transparently.
@@ -131,14 +147,19 @@ class _OpsProxy:
 
     def __getattr__(self, name: str):
         def dispatch(*args, **kwargs):
-            log = object.__getattribute__(self, "command_log")
             filename = object.__getattribute__(self, "_filename")
-            line = _format_ops_cmd(name, args, kwargs)
-            log.append(line)
             if filename is not None:
+                # pyfile mode: the formatted source line is the output.
+                log = object.__getattribute__(self, "command_log")
+                line = _format_ops_cmd(name, args, kwargs)
+                log.append(line)
                 with open(filename, "a") as fh:
                     fh.write(line)
             else:
+                # Live/memory mode: command_log has no reader — model_command_list
+                # and all_command are write-only aliases — so skip _format_ops_cmd
+                # and the append entirely. This avoids the per-ops-call repr churn
+                # and unbounded command_log growth across the whole build+analysis.
                 module = object.__getattribute__(self, "_module")
                 return getattr(module, name)(*args, **kwargs)
 
@@ -2813,8 +2834,9 @@ class Analysis:
         self.ele_stresses = dict()  # shell stress resultants at Gauss points
         self.mesh_node_counter = node_counter  # set node counter based on current Mesh
         self.mesh_ele_counter = ele_counter  # set ele counter based on current Mesh
-        # save deepcopy of load case object
-        self.load_cases_obj = deepcopy(load_case)
+        # NOTE: previously stored `self.load_cases_obj = deepcopy(load_case)` here,
+        # but it was write-only (no reader in-tree) and deep-copied the load case
+        # once per Analysis — ~50× per moving load case. Dropped to cut peak RSS.
         # var to store all eval command
         self.all_command = []
         # if true for pyfile, create pyfile for analysis command
@@ -3335,10 +3357,15 @@ class Results:
                     ele_tag = list(inc_resp_list_of_2_dict[4].keys())
                     extracted_ele_nodes_list = True
         # convert to np array format
-        basic_array_disp = np.array(basic_node_disp_list, dtype=object)
-        basic_array_vel = np.array(basic_node_vel_list, dtype=object)
-        basic_array_accel = np.array(basic_node_accel_list, dtype=object)
-        force_array = np.array(basic_ele_force_list, dtype=object)
+        # object->float64 where the rows are rectangular (they are for a beam-only
+        # model: every node has 6 disp components, every beam element the same
+        # force components). Packed float64 is far lighter to retain than an object
+        # array of Python lists, and the cast is lossless; ragged shell data falls
+        # back to object automatically.
+        basic_array_disp = _to_float64_or_object(basic_node_disp_list)
+        force_array = _to_float64_or_object(basic_ele_force_list)
+        # velocity/acceleration are recorded but not emitted into the dataset:
+        # they are zero for static analysis and have no downstream consumer.
         ele_array = np.array(ele_nodes_list, dtype=object)
 
         ele_tag = np.array(ele_tag)
@@ -3356,9 +3383,6 @@ class Results:
             if len(e) == 2
             if tag < main_ele_tags
         ]
-        force_array_shell = np.array(base_ele_force_list_shell)
-        force_array_beam = np.array(base_ele_force_list_beam)
-
         # create data array for each basic load case if any, else return
         if basic_array_disp.size:
             # displacement data array
@@ -3371,26 +3395,6 @@ class Results:
                     self.dim[2]: self.displacement_component,
                 },
             )
-            basic_da_v = xr.DataArray(
-                data=basic_array_vel,
-                dims=self.dim,
-                coords={
-                    self.dim[0]: basic_load_case_coord,
-                    self.dim[1]: node,
-                    self.dim[2]: self.vel_component,
-                },
-            )
-
-            basic_da_a = xr.DataArray(
-                data=basic_array_accel,
-                dims=self.dim,
-                coords={
-                    self.dim[0]: basic_load_case_coord,
-                    self.dim[1]: node,
-                    self.dim[2]: self.acc_component,
-                },
-            )
-
             ele_nodes_beam = xr.DataArray(
                 data=ele_array_beam,
                 dims=[self.dim2[1], "Nodes"],
@@ -3398,6 +3402,10 @@ class Results:
             )
             # create data set based on
             if isinstance(self.mesh_obj, ShellLinkMesh):
+                # These two arrays are consumed only in this shell branch, so build
+                # them here rather than unconditionally above.
+                force_array_shell = np.array(base_ele_force_list_shell)
+                force_array_beam = np.array(base_ele_force_list_beam)
                 force_da_beam = xr.DataArray(
                     data=force_array_beam,
                     dims=self.dim2,
@@ -3425,8 +3433,6 @@ class Results:
                 # Shell stress resultants at Gauss points (32 per element)
                 ds_vars = {
                     "displacements": basic_da_d,
-                    "velocity": basic_da_v,
-                    "acceleration": basic_da_a,
                     "forces_beam": force_da_beam,
                     "forces_shell": force_da_shell,
                     "ele_nodes_beam": ele_nodes_beam,
@@ -3470,8 +3476,6 @@ class Results:
                 result = xr.Dataset(
                     {
                         "displacements": basic_da_d,
-                        "velocity": basic_da_v,
-                        "acceleration": basic_da_a,
                         "forces": force_da_beam,
                         "ele_nodes": ele_nodes_beam,
                     }

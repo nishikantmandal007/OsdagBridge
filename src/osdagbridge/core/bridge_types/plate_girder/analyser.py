@@ -1,5 +1,36 @@
-import ospgrillage as og
-import xarray as xr
+import importlib as _importlib
+
+
+class _LazyModule:
+    """Import a heavy module on first attribute access, then behave as it.
+
+    ospgrillage (and its xarray/openseespy/opsvis stack) is ~100 MB and is only
+    needed when a design actually runs. Since designs now run in a subprocess,
+    the GUI process typically never touches these — deferring the import keeps
+    them off the startup path entirely. All ``og.foo`` / ``xr.foo`` call sites
+    below resolve through here unchanged; once loaded (or already in sys.modules,
+    e.g. via the forkserver preload) the lookup is a cached dict hit.
+    """
+
+    __slots__ = ("_name", "_mod")
+
+    def __init__(self, name):
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_mod", None)
+
+    def _load(self):
+        mod = object.__getattribute__(self, "_mod")
+        if mod is None:
+            mod = _importlib.import_module(object.__getattribute__(self, "_name"))
+            object.__setattr__(self, "_mod", mod)
+        return mod
+
+    def __getattr__(self, attr):
+        return getattr(self._load(), attr)
+
+
+og = _LazyModule("ospgrillage")
+xr = _LazyModule("xarray")
 # from math import sqrt, pi
 # import openseespy.opensees as ops
 from osdagbridge.core.utils.codes.irc6_2017 import IRC6_2017

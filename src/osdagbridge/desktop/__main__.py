@@ -9,6 +9,35 @@ except Exception:
     pass
 
 
+def _tune_glibc_malloc():
+    """Pin glibc's mmap/arena behaviour so the heap floor stops creeping up.
+
+    glibc's allocator dynamically raises M_MMAP_THRESHOLD as large blocks are
+    freed (a "ratchet"): once raised, big buffers land on the main arena and are
+    never returned to the OS, so the resident floor climbs every design cycle.
+    Pinning M_MMAP_THRESHOLD to a fixed value disables that ratchet — large
+    allocations mmap and are unmapped on free — and capping M_ARENA_MAX curbs
+    per-thread arena fragmentation. Must run before any thread (Qt/numpy) starts,
+    hence first thing in this module. Linux-only, fail-open. The env-var form
+    (MALLOC_MMAP_THRESHOLD_) is read only at libc init, so it is useless from
+    Python — mallopt() is the only lever left once the interpreter is up.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        M_MMAP_THRESHOLD = -3
+        M_ARENA_MAX = -8
+        libc.mallopt(M_MMAP_THRESHOLD, 131072)   # 128 KB, fixed (kills the ratchet)
+        libc.mallopt(M_ARENA_MAX, 2)
+    except Exception:
+        pass
+
+
+_tune_glibc_malloc()
+
+
 def _register_conda_dll_directories():
     """Add the active conda environment's native DLL folders to the Windows DLL
     search path before numpy/scipy/openseespy are imported.

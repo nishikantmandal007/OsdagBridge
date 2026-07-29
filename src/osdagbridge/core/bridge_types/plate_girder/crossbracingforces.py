@@ -642,27 +642,18 @@ class CrossBracingForces:
             f"  diag L={L_diag_mm} mm  chord L={L_chord_mm} mm\n"
             f"{sep}"
         )
-        from osdagbridge.core.utils.connect import design_pool, run_calculation
-
-        cpu_count = __import__("os").cpu_count() or 4
-        max_workers = min(cpu_count, len(jobs))
+        from osdagbridge.core.utils.connect import run_member_design_jobs
 
         t0 = time.perf_counter()
         results: dict = {}
 
-        # spawn-context pool: forking under the design worker thread deadlocks (see design_pool).
-        with design_pool(max_workers) as executor:
-            futures = {
-                executor.submit(run_calculation, j[3]): j
-                for j in jobs
-            }
-            for future, (pair, member, force_type, _) in futures.items():
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    print(f"  [CrossBracing] SKIP {pair} {member} {force_type}: {exc}")
-                    result = None
-                results.setdefault(pair, {}).setdefault(member, {})[force_type] = result
+        # Single dispatch: run_member_design_jobs runs this small batch serially
+        # in-process (no per-batch pool spawn/import overhead, lower peak memory,
+        # no fork under the design QThread) and only escalates to the capped pool
+        # for large batches on forkserver platforms.
+        keyed_jobs = [((pair, member, force_type), d) for (pair, member, force_type, d) in jobs]
+        for (pair, member, force_type), result in run_member_design_jobs(keyed_jobs).items():
+            results.setdefault(pair, {}).setdefault(member, {})[force_type] = result
 
         print(f"  Total time : {time.perf_counter() - t0:.3f}s  |  {len(jobs)} designs\n{sep}")
         return results

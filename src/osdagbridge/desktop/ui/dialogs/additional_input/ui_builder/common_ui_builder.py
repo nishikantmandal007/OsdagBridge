@@ -1596,21 +1596,26 @@ class UIBuilder(QWidget):
                 allowed_values=allowed,
                 parent=_combo,
             )
-            if dlg.exec():
-                chosen = dlg.selected_values()
-                if _ai and hasattr(_ai, "working_input_dict"):
-                    _ai.working_input_dict[_fid + ".selected"] = chosen
-                
-                # Domain callback — passes field_id and chosen to owner
-                on_selected = field_def.get("on_selected") or ""
-                if on_selected and hasattr(owner, on_selected):
-                    getattr(owner, on_selected)(_fid, chosen)
+            # Parented to a permanent QComboBox — delete explicitly or every
+            # "Custom" selection permanently adds a dialog widget tree.
+            try:
+                if dlg.exec():
+                    chosen = dlg.selected_values()
+                    if _ai and hasattr(_ai, "working_input_dict"):
+                        _ai.working_input_dict[_fid + ".selected"] = chosen
 
-            else:
-                # user cancelled — revert combo to "All"
-                _combo.blockSignals(True)
-                _combo.setCurrentText("All")
-                _combo.blockSignals(False)
+                    # Domain callback — passes field_id and chosen to owner
+                    on_selected = field_def.get("on_selected") or ""
+                    if on_selected and hasattr(owner, on_selected):
+                        getattr(owner, on_selected)(_fid, chosen)
+
+                else:
+                    # user cancelled — revert combo to "All"
+                    _combo.blockSignals(True)
+                    _combo.setCurrentText("All")
+                    _combo.blockSignals(False)
+            finally:
+                dlg.deleteLater()
 
         combo.currentTextChanged.connect(_on_changed)
         return combo
